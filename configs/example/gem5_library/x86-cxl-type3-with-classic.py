@@ -54,6 +54,9 @@ from gem5.isas import ISA
 from gem5.simulate.simulator import Simulator
 from gem5.simulate.exit_event import ExitEvent
 from gem5.resources.resource import DiskImageResource, KernelResource
+from m5.objects import PyTrafficGen
+from m5.ticks import fromSeconds
+from m5.util.convert import toMemoryBandwidth, toMemorySize
 
 # Check ensures the gem5 binary is compiled to X86.
 requires(isa_required=ISA.X86)
@@ -76,6 +79,31 @@ parser.add_argument('--cpu_type', type=str, choices=['TIMING', 'O3'],
                     default='TIMING', help='CPU type')
 parser.add_argument('--cxl_mem_type', type=str, choices=['Simple', 'DRAM'], 
                     default='DRAM', help='CXL memory type')
+parser.add_argument(
+    "--gpu-direction",
+    choices=["gpu-to-cxl", "cxl-to-gpu"],
+    default="gpu-to-cxl",
+)
+
+parser.add_argument(
+    "--gpu-copy-mib",
+    type=int,
+    default=16,
+)
+
+parser.add_argument(
+    "--gpu-offered-bw",
+    type=str,
+    default="32GB/s",
+)
+
+parser.add_argument(
+    "--gpu-request-size",
+    type=int,
+    choices=[64, 128, 256, 4096],
+    default=64,
+)
+
 
 args = parser.parse_args()
 
@@ -120,7 +148,49 @@ board = X86Board(
     cxl_memory=cxl_dram,
     is_asic=(args.is_asic == 'True')
 )
+# GPU DMA synthetic request source
+board.gpu_dma = PyTrafficGen()
 
+# 接到系统内存总线的CPU侧。
+# 这样它绕过CPU的L1/L2/L3，但访问CXL地址时仍经过CXLBridge。
+board.gpu_dma.port = cache_hierarchy.get_cpu_side_port()
+
+m5.ticks.fixGlobalFrequency()
+
+copy_bytes = args.gpu_copy_mib * 1024 * 1024
+block_size = args.gpu_request_size
+
+# x86_board.py中Type-3地址从4GiB开始
+CXL_BASE = 0x100000000
+
+# 建议预留Type-3内存顶部64MiB，不让Linux使用
+reserve_size = toMemorySize("64MiB")
+cxl_size = cxl_dram.get_size()
+
+if copy_bytes > reserve_size:
+    raise ValueError(
+        "gpu-copy-mib must not exceed the reserved 64MiB test range"
+    )
+
+cxl_test_start = CXL_BASE + cxl_size - reserve_size
+cxl_test_end = cxl_test_start + copy_bytes
+
+offered_rate = toMemoryBandwidth(args.gpu_offered_bw)
+
+# 每发送一个block的时间间隔
+period = max(
+    1,
+    fromSeconds(block_size / offered_rate),
+)
+
+# gpu-to-cxl：GPU DMA写Type-3内存
+# cxl-to-gpu：GPU DMA读Type-3内存
+read_percent = (
+    0 if args.gpu_direction == "gpu-to-cxl" else 100
+)
+
+gpu_copy_state = None
+gpu_exit_state = None
 # Here we set the Full System workload.
 # The `set_kernel_disk_workload` function for the X86Board takes a kernel, a
 # disk image, and, optionally, a command to run.
@@ -130,29 +200,104 @@ board = X86Board(
 # TIMING/O3 and continue the simulation to run the command. After simulation
 # has ended you may inspect `m5out/board.pc.com_1.device` to see the echo
 # output.
+# command = (
+#     "m5 exit;"
+#     + "numactl -H;"
+#     + "m5 resetstats;"
+#     # + "/home/cxl_benchmark/" + args.test_cmd + ";"
+#     + "numactl -N 0 -m 1 /home/test_code/simple_test;"
+# )
+
+# command = (
+#     "m5 exit;"
+#     + "numactl -H;"
+#     + "m5 resetstats;"
+#     + "/home/cxl_benchmark/" + args.test_cmd + ";"
+#     + "m5 dumpstats;"
+#     + "m5 exit;"
+# )
+
 command = (
     "m5 exit;"
-    + "numactl -H;"
-    + "m5 resetstats;"
-    # + "/home/cxl_benchmark/" + args.test_cmd + ";"
-    + "numactl -N 0 -m 1 /home/test_code/simple_test;"
 )
+
+# command = """
+# m5 exit
+# numactl -H
+
+# echo "===== DDR only: node 0 ====="
+# m5 resetstats
+# numactl --cpunodebind=0 --membind=0 /home/test_code/simple_test
+# m5 dumpstats
+
+# echo "===== CXL only: node 1 ====="
+# m5 resetstats
+# numactl --cpunodebind=0 --membind=1 /home/test_code/simple_test
+# m5 dumpstats
+
+# echo "===== DDR+CXL page interleave ====="
+# m5 resetstats
+# numactl --cpunodebind=0 --interleave=0,1 /home/test_code/simple_test
+# m5 dumpstats
+
+# m5 exit
+# """
 
 # Please modify the paths of kernel and disk_image according to the location of your files.
 board.set_kernel_disk_workload(
-    kernel=KernelResource(local_path='/home/xxx/code/fs_image/vmlinux'),
-    disk_image=DiskImageResource(local_path='/home/xxx/code/fs_image/parsec.img'),
+    kernel=KernelResource(local_path='/root/simcxl-resources/vmlinux'),
+    disk_image=DiskImageResource(local_path='/root/simcxl-resources/parsec.img'),
     readfile_contents=command,
     kernel_args=board.get_default_kernel_args() + ["idle=nomwait"],
 )
 
+# simulator = Simulator(
+#     board=board,
+#     on_exit_event={
+#         ExitEvent.EXIT: (func() for func in [processor.switch])
+#     },
+# )
+
+def handle_exit():
+    # 第一次退出：启动GPU DMA模拟
+    processor.switch()
+    m5.stats.reset()
+
+    # createLinear/createExit为C++方法，需在instantiate之后才能调用，
+    # 因此在此(第一次exit时，系统已实例化)创建generator
+    gpu_copy_state = board.gpu_dma.createLinear(
+        fromSeconds(10.0),   # 最大持续时间；通常先由data_limit结束
+        cxl_test_start,
+        cxl_test_end,
+        block_size,
+        period,
+        period,
+        read_percent,
+        copy_bytes,
+    )
+
+    gpu_exit_state = board.gpu_dma.createExit(0)
+
+    board.gpu_dma.start([
+        gpu_copy_state,
+        gpu_exit_state,
+    ])
+
+    # False表示继续模拟
+    yield False
+
+    # TrafficGen的createExit触发第二次退出
+    m5.stats.dump()
+
+    # True表示结束模拟
+    yield True
+
 simulator = Simulator(
     board=board,
     on_exit_event={
-        ExitEvent.EXIT: (func() for func in [processor.switch])
+        ExitEvent.EXIT: handle_exit()
     },
 )
-
 print("Running the simulation Classic MESI Three Level protocol...")
 print("Using KVM cpu for boot")
 

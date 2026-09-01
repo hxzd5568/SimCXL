@@ -281,8 +281,18 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             X86E820Entry(addr=0xFFFF0000, size="64kB", range_type=2)
         )
 
+        gpu_test_reserve = toMemorySize("64MiB")
+
+        cxl_linux_visible_size = (
+            cxl_mem_range.size() - gpu_test_reserve
+        )
+
         entries.append(
-            X86E820Entry(addr=0x100000000, size=f"{cxl_mem_range.size()}B", range_type=20)
+            X86E820Entry(
+                addr=0x100000000,
+                size=f"{cxl_linux_visible_size}B",
+                range_type=20
+            )
         )
 
         self.workload.e820_table.entries = entries
