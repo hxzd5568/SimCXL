@@ -52,6 +52,7 @@
 #include "mem/tport.hh"
 #include "params/RubyPort.hh"
 #include "sim/clocked_object.hh"
+#include "sim/system.hh"
 
 namespace gem5
 {
@@ -103,7 +104,7 @@ class RubyPort : public ClockedObject
         void recvFunctional(PacketPtr pkt);
 
         AddrRangeList getAddrRanges() const
-        { AddrRangeList ranges; return ranges; }
+        { return owner.system->getPhysMem().getConfAddrRanges(); }
 
         void addToRetryList();
 

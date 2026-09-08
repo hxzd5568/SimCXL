@@ -56,13 +56,13 @@ board = X86BoardCXLType1RAO(
 command = (
     "m5 exit;"
     + "echo 'This is running on Timing CPU cores.';"
-    + "/home/cxl_benchmark/rao/type1_rao_test /home/cxl_benchmark/rao/trace/CENTRAL_ADD_100.csv;"
+    + "/home/cxl_benchmark/rao/type1_rao_test /home/cxl_benchmark/rao/trace/RAM_ADD_100.csv;"
     + "m5 exit;"
 )
 
 board.set_kernel_disk_workload(
-    kernel=KernelResource(local_path="/home/wyj/code/fs_image/vmlinux"),
-    disk_image=DiskImageResource(local_path="/home/wyj/code/fs_image/parsec.img"),
+    kernel=KernelResource(local_path="/root/simcxl-resources/vmlinux"),
+    disk_image=DiskImageResource(local_path="/root/simcxl-resources/parsec.img"),
     readfile_contents=command,
 )
 

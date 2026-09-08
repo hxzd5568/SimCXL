@@ -140,14 +140,12 @@ CXLMemCtrl::write(PacketPtr pkt)
 AddrRangeList
 CXLMemCtrl::getAddrRanges() const
 {
-    DPRINTF(CXLRange, "PIO base AddrRanges:\n");
-    AddrRangeList ranges = PciDevice::getAddrRanges();
-    for (const auto &r : ranges) {
-        DPRINTF(CXLRange,
-                "  range [%#lx - %#lx) size %#lx\n",
-                r.start(), r.end(), r.size());
-    }
-    return ranges;
+    // CXL memory is accessed through the CXL.mem protocol (cxlRspPort),
+    // not through the PIO port. Do not advertise the BAR ranges here,
+    // otherwise accesses to the CXL memory are routed to the PIO port
+    // (which only handles config-space-sized accesses and panics on
+    // cache-line-sized reads).
+    return AddrRangeList();
 }
 
 bool
