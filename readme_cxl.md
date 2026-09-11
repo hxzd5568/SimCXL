@@ -164,3 +164,26 @@ line 事务发往 CXL.mem」这一段，而非端到端含 PCIe 的 GPU 视角�
 要补上前端，需在 Ruby DMA machine 之前新增 PCIe packetizer + link + TLP 终止模型，
 把 128/256B TLP 的 header 开销、链路速率、credit flow 显式建模，再在 Home Agent
 处拆成 64B 交给现有 Ruby 路径。
+3
+# latest task
+完成。commit 6d01a9bd8d。
+结论：之前 read 链路不遵循抽象，现已修复
+之前有两个缺口，现在都补上了：
+缺口
+GPU 侧发 256B
+Home Agent 拆分
+现在的 read 链路已符合你给的抽象：
+GPU 发 256B PCIe MRd（只头）
+  → DMASequencer 并行拆 4×64B CXL.mem MemRd
+  → Type-3 返回 4×64B
+  → DMASequencer 聚合 → 1×256B 完成响应 → GPU
+实测结果（512 MiB）
+请求大小
+64B
+256B
+- *写 +12%*：协议层请求数减 4 倍，TBE/header 摊薄——这正是"保持 PCIe 包大"的效率收益。
+- 读基本无变化：并行拆分已生效（DRAM 总线利用率 45%→59%），但读带宽被 DRAM 读延迟卡死（row hit 86.9%），与请求粒度无关。
+改动文件：
+- src/mem/ruby/system/DMASequencer.{hh,cc}：DMARequest/DMALine 结构，makeRequest 并行拆分，dataCallback/ackCallback 按 line 累加完成
+- src/cpu/testers/traffic_gen/base_gen.cc：放宽 blocksize 限制
+- readme_cxl.md：更新结论
