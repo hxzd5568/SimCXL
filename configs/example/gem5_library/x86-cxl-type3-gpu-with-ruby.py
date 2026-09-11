@@ -96,7 +96,9 @@ board.pc.south_bridge.cxl_device.req_size = args.cxl_rsp_size
 board.pc.south_bridge.cxl_device.proto_proc_lat = args.cxl_proto_lat
 
 # GPU DMA 合成流量源，接到 IO 总线（在 Ruby 下经 DMA machine 访问 CXL）
-board.gpu_dma = PyTrafficGen(progress_check="1000000s")
+# max_outstanding_reqs 限制在飞请求数，配合下面的 completion 等待实现端到端计时。
+board.gpu_dma = PyTrafficGen(progress_check="1000000s",
+                             max_outstanding_reqs=args.cxl_rsp_size * 4)
 board.gpu_dma.port = board.iobus.cpu_side_ports
 
 m5.ticks.fixGlobalFrequency()
@@ -129,6 +131,12 @@ board.set_kernel_disk_workload(
 
 TICK_PER_SEC = 1e12
 
+POLL_TICKS = int(TICK_PER_SEC * 1e-6)  # poll every 1us
+
+
+def _bytes_written():
+    return int(board.gpu_dma.resolveStat("bytesWritten").value)
+
 
 def handle_exit():
     processor.switch()
@@ -147,7 +155,19 @@ def handle_exit():
     )
     gpu_exit_state = board.gpu_dma.createExit(0)
     board.gpu_dma.start([gpu_copy_state, gpu_exit_state])
+    # 第一次退出：注入完成（LinearGen 到达 data_limit -> ExitGen）。此时还有
+    # 在飞请求未返回，不能立刻计时。
     yield False
+
+    # 等待所有写响应返回（bytesWritten 在 recvTimingResp 里累加，代表真正
+    # 落库完成）。用 tick exit 反复轮询。
+    while _bytes_written() < copy_bytes:
+        m5.scheduleTickExitFromCurrent(POLL_TICKS)
+        yield False
+
+    written = _bytes_written()
+    assert written == copy_bytes, \
+        f"bytesWritten {written} != copy_bytes {copy_bytes}"
 
     elapsed = (m5.curTick() - t_start) / TICK_PER_SEC
     print(f"[GPU->CXL (Ruby)] {copy_bytes} bytes in {elapsed:.6f}s "
@@ -156,9 +176,13 @@ def handle_exit():
     yield True
 
 
+_handler = handle_exit()
 simulator = Simulator(
     board=board,
-    on_exit_event={ExitEvent.EXIT: handle_exit()},
+    on_exit_event={
+        ExitEvent.EXIT: _handler,
+        ExitEvent.SCHEDULED_TICK: _handler,
+    },
 )
 
 print("Running GPU->CXL (Ruby MESI Two Level)...")
