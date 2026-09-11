@@ -162,7 +162,7 @@ if args.run_memcpy:
         + "m5 exit;"
     )
 else:
-    command = "m5 exit; numactl -H;"
+    command = "m5 exit; while :; do :; done;"
 
 board.set_kernel_disk_workload(
     kernel=KernelResource(local_path='/root/simcxl-resources/vmlinux'),
