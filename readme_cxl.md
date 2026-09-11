@@ -8,6 +8,7 @@
 |---|---|---|
 | `configs/example/gem5_library/x86-cxl-type3-with-classic.py` | Classic | HBM (`HBM_1000_4H_1x128`, 8 通道) |
 | `configs/example/gem5_library/x86-cxl-type3-gpu-with-ruby.py` | Ruby (MESI Two Level) | DDR5 (`DIMM_DDR5_4400`, 2 通道) |
+| `configs/example/gem5_library/x86-cxl-checkpoint-restore.py` | Ruby (MESI Two Level) | DDR5 (`DIMM_DDR5_4400`, 2 通道) |
 
 两个脚本都用 `PyTrafficGen` 作为合成 GPU DMA 流量源，路径分别是：
 
@@ -88,6 +89,11 @@ scons build/X86/gem5.opt -j`nproc`
 ./build/X86/gem5.opt \
     configs/example/gem5_library/x86-cxl-type3-gpu-with-ruby.py \
     --gpu-copy-mib 512 --gpu-op read
+
+# Checkpoint save/restore（一次模拟内先写后读）
+./build/X86/gem5.opt \
+    configs/example/gem5_library/x86-cxl-checkpoint-restore.py \
+    --gpu-copy-mib 512
 ```
 
 脚本已自动按 `--gpu-copy-mib` 扩大 CXL 顶部预留区，并同步修改 E820 中 Linux 可见
@@ -104,3 +110,42 @@ IOMMU/ATS、GPU DMA descriptor 与 copy-engine 调度。
   连续多个 64B cache-line 请求，而非单个 TrafficGen packet。
 - `--dma-copy` 模式同时启动两条无数据依赖的并发流量（读 DRAM + 写 CXL），并非
   真正的 DRAM→CXL copy。
+
+## Checkpoint save/restore 模型结论
+
+`x86-cxl-checkpoint-restore.py` 以应用层语义模拟 GPU checkpoint 工作流：
+
+- **save**（checkpoint）：GPU 把状态写入 CXL（CXL.mem 写方向），实测 28.42 GB/s。
+- **restore**（恢复）：GPU 从 CXL 读回状态（CXL.mem 读方向），实测 20.57 GB/s。
+
+### 当前模型在真实协议路径中的语义定位
+
+以 H100 → Root Complex → CXL Type-3 为例，真实路径是：
+
+```
+GPU PCIe packetizer (128/256B TLP)
+  → PCIe link → Host IO Bridge/IOMMU → Home Agent/CXL Host Bridge（拆 64B）
+  → CXL.mem link → CXL switch → Type-3 controller → DRAM
+```
+
+SimCXL 现有 Ruby 路径：
+
+```
+GPU (PyTrafficGen) → DMASequencer → Ruby Directory → cxl_rsp_port → CXLMemCtrl
+```
+
+这更接近「**已经进入主机 Home Agent 并转换成 64B 内存事务之后**」的后半段。
+它缺少的是：
+
+1. GPU PCIe packetizer（生成 128/256B TLP）；
+2. PCIe 链路；
+3. PCIe TLP 终止/转换阶段（IOMMU/IO Bridge/Home Agent）。
+
+因此，当前 Ruby 路径中按 64B 拆分的位置，在语义上**可以近似主机 Root Complex /
+CXL Host Bridge 的转换结果**；但**不能声称已经模拟了前面的 128/256B PCIe TLP**。
+checkpoint save/restore 的双向带宽数据，度量的是「Home Agent 之后、以 64B cache
+line 事务发往 CXL.mem」这一段，而非端到端含 PCIe 的 GPU 视角带宽。
+
+要补上前端，需在 Ruby DMA machine 之前新增 PCIe packetizer + link + TLP 终止模型，
+把 128/256B TLP 的 header 开销、链路速率、credit flow 显式建模，再在 Home Agent
+处拆成 64B 交给现有 Ruby 路径。
