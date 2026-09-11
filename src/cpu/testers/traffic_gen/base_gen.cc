@@ -87,9 +87,12 @@ StochasticGen::StochasticGen(SimObject &obj,
           minPeriod(min_period), maxPeriod(max_period),
           readPercent(read_percent), dataLimit(data_limit)
 {
-    if (blocksize > cacheLineSize)
-        fatal("TrafficGen %s block size (%d) is larger than "
-              "cache line size (%d)\n", name(),
+    // A request may span multiple cache lines (e.g. a 256B PCIe MRd split
+    // into 4x64B cache-line requests by the Home Agent). Require that the
+    // block size is a positive multiple of the cache line size.
+    if (blocksize == 0 || (blocksize % cacheLineSize) != 0)
+        fatal("TrafficGen %s block size (%d) must be a positive multiple "
+              "of cache line size (%d)\n", name(),
               blocksize, cacheLineSize);
 
     if (read_percent > 100)

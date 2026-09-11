@@ -105,9 +105,10 @@ scons build/X86/gem5.opt -j`nproc`
 PCIe 速率与 lane 数、TLP/CXL FLIT 头部开销、credit flow control、GPU MPS/MRRS、
 IOMMU/ATS、GPU DMA descriptor 与 copy-engine 调度。
 
-- `--gpu-request-size 128/256` 受 `StochasticGen` 的 `blocksize <= cacheLineSize`
-  限制（cache line 为 64B），当前不能直接使用；GPU 的 128/256B burst 应建模为
-  连续多个 64B cache-line 请求，而非单个 TrafficGen packet。
+- `--gpu-request-size 128/256` 现已支持（`StochasticGen` 放宽为要求
+  `blocksize % cacheLineSize == 0`）：GPU 发一个 256B 读请求，Home Agent
+  （`DMASequencer`）把它**并行拆成 4 个 64B cache-line 请求**（对应 PCIe MRd
+  256B → 4×CXL.mem MemRd），4 个都返回后聚合回一个 256B 完成响应。
 - `--dma-copy` 模式同时启动两条无数据依赖的并发流量（读 DRAM + 写 CXL），并非
   真正的 DRAM→CXL copy。
 
@@ -115,8 +116,21 @@ IOMMU/ATS、GPU DMA descriptor 与 copy-engine 调度。
 
 `x86-cxl-checkpoint-restore.py` 以应用层语义模拟 GPU checkpoint 工作流：
 
-- **save**（checkpoint）：GPU 把状态写入 CXL（CXL.mem 写方向），实测 28.42 GB/s。
-- **restore**（恢复）：GPU 从 CXL 读回状态（CXL.mem 读方向），实测 20.57 GB/s。
+- **save**（checkpoint）：GPU 把状态写入 CXL（CXL.mem 写方向）。
+- **restore**（恢复）：GPU 从 CXL 读回状态（CXL.mem 读方向）。
+
+512 MiB 下，请求大小对带宽的影响（Ruby，DDR5 后端）：
+
+| 请求大小 | save 写 | restore 读 | 读 DRAM 总线利用率 |
+|---|---|---|---|
+| 64B | 28.42 GB/s | 20.57 GB/s | ~45% |
+| 256B | 31.81 GB/s | 20.67 GB/s | 58.65% |
+
+- **写方向**：256B 大包收益明显（+12%），因为 Home Agent 拆成 4×64B 后，协议层
+  请求数减少 4 倍，TBE/header 开销被摊薄。
+- **读方向**：256B 几乎无收益。并行拆分确实提高了 DRAM 总线利用率（45%→59%），
+  但读带宽被 DRAM 读延迟卡住（row hit 86.9%、`bytesPerActivate` ~490B），
+  与请求粒度无关。
 
 ### 当前模型在真实协议路径中的语义定位
 
@@ -135,11 +149,12 @@ GPU (PyTrafficGen) → DMASequencer → Ruby Directory → cxl_rsp_port → CXLM
 ```
 
 这更接近「**已经进入主机 Home Agent 并转换成 64B 内存事务之后**」的后半段。
-它缺少的是：
+`DMASequencer` 现在会把一个 256B 请求**并行拆成 4 个 64B cache-line 请求**，
+在语义上对应 Home Agent/CXL Host Bridge 的 64B 拆分；但仍缺少：
 
 1. GPU PCIe packetizer（生成 128/256B TLP）；
 2. PCIe 链路；
-3. PCIe TLP 终止/转换阶段（IOMMU/IO Bridge/Home Agent）。
+3. PCIe TLP 终止/转换阶段（IOMMU/IO Bridge）。
 
 因此，当前 Ruby 路径中按 64B 拆分的位置，在语义上**可以近似主机 Root Complex /
 CXL Host Bridge 的转换结果**；但**不能声称已经模拟了前面的 128/256B PCIe TLP**。

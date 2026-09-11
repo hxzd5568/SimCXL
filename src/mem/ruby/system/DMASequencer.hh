@@ -45,6 +45,11 @@ namespace gem5
 namespace ruby
 {
 
+// A single DMA request as seen by the Ruby DMA machine. One request may span
+// several cache lines (e.g. a 256B PCIe MRd split into 4x64B CXL.mem MemRd
+// requests by the Home Agent). The sub-requests are issued in parallel and
+// tracked per cache line via `DMALine` below; `bytes_completed` counts the
+// bytes for which the response has already been received.
 struct DMARequest
 {
     DMARequest(uint64_t start_paddr, int len, bool write, int bytes_completed,
@@ -57,6 +62,19 @@ struct DMARequest
     int bytes_issued;
     uint8_t *data;
     PacketPtr pkt;
+};
+
+// Tracks one cache-line sub-request of a (possibly multi-cache-line) DMA
+// request. `parent` points at the owning DMARequest; `data_offset` is the
+// byte offset of this cache line within the parent's data buffer, and
+// `block_offset` the offset of the valid data within the 64B DataBlock of
+// the response (non-zero only for the first, possibly unaligned, cache line).
+struct DMALine
+{
+    std::shared_ptr<DMARequest> parent;
+    int data_offset;
+    int block_offset;
+    int len;
 };
 
 class DMASequencer : public RubyPort
@@ -81,11 +99,10 @@ class DMASequencer : public RubyPort
     void recordRequestType(DMASequencerRequestType requestType);
 
   private:
-    void issueNext(const Addr &addr);
-
     uint64_t m_data_block_mask;
+    uint64_t m_data_block_size;
 
-    typedef std::unordered_map<Addr, DMARequest> RequestTable;
+    typedef std::unordered_map<Addr, DMALine> RequestTable;
     RequestTable m_RequestTable;
 
     int m_outstanding_count;
