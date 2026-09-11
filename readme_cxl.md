@@ -41,14 +41,23 @@
 | 4 MiB | 3.68 GB/s |
 | 8 MiB | 6.64 GB/s |
 | 16 MiB | 10.99 GB/s |
-| **64 MiB** | **21.62 GB/s** |
+| 64 MiB | 21.62 GB/s |
+| **512 MiB** | **28.47 GB/s** |
 
-Classic 配置同样受影响（4 MiB 仅 4.96 GB/s）。**推荐固定使用 `--gpu-copy-mib 64`
-及以上的数据量进行带宽实验。**
+Classic 配置同样受影响（4 MiB 仅 4.96 GB/s）。64 MiB 仍受约 0.86ms 固定开销影响
+（稳态带宽约 28.5 GB/s，64 MiB 只有 21.62）。**推荐固定使用
+`--gpu-copy-mib 512` 及以上的数据量进行带宽实验。**
 
-数据量足够大后，Ruby 配置（DDR5 后端）与 Classic 配置（HBM 后端）都能达到
-约 21.6 GB/s，二者并无「Ruby 显著更慢」的差异。之前的 3.6~3.7 GB/s 全部来自
-4 MiB 小数据量下的固定开销，而非 Ruby 路径本身的问题。
+数据量足够大后，Ruby 配置（DDR5 后端）与 Classic 配置（HBM 后端）都能达到约
+28 GB/s 量级的带宽，二者并无「Ruby 显著更慢」的差异。之前的 3.6~3.7 GB/s 全部
+来自 4 MiB 小数据量下的固定开销，而非 Ruby 路径本身的问题。
+
+512 MiB 下稳态带宽（Ruby，DDR5 后端）：
+
+| 操作 | 带宽 |
+|---|---|
+| write | 28.47 GB/s |
+| read | 20.75 GB/s |
 
 ## 256B 请求 vs 64B 请求
 
@@ -70,16 +79,19 @@ Classic 配置同样受影响（4 MiB 仅 4.96 GB/s）。**推荐固定使用 `-
 # 构建（Type-3 内存扩展器，Ruby 协议）
 scons build/X86/gem5.opt -j`nproc`
 
-# Ruby 配置，64 MiB 写带宽
+# Ruby 配置，512 MiB 写带宽
 ./build/X86/gem5.opt \
     configs/example/gem5_library/x86-cxl-type3-gpu-with-ruby.py \
-    --gpu-copy-mib 64 --gpu-op write
+    --gpu-copy-mib 512 --gpu-op write
 
-# Classic 配置，64 MiB 写带宽（CXL 后端为 HBM）
+# Ruby 配置，512 MiB 读带宽
 ./build/X86/gem5.opt \
-    configs/example/gem5_library/x86-cxl-type3-with-classic.py \
-    --gpu-copy-mib 64 --gpu-direction gpu-to-cxl
+    configs/example/gem5_library/x86-cxl-type3-gpu-with-ruby.py \
+    --gpu-copy-mib 512 --gpu-op read
 ```
+
+脚本已自动按 `--gpu-copy-mib` 扩大 CXL 顶部预留区，并同步修改 E820 中 Linux 可见
+的 CXL 大小（`cxl_size - reserve_size`），避免测试区与 Linux 管理的 CXL 内存冲突。
 
 ## 尚未解决的建模边界
 
@@ -90,7 +102,5 @@ IOMMU/ATS、GPU DMA descriptor 与 copy-engine 调度。
 - `--gpu-request-size 128/256` 受 `StochasticGen` 的 `blocksize <= cacheLineSize`
   限制（cache line 为 64B），当前不能直接使用；GPU 的 128/256B burst 应建模为
   连续多个 64B cache-line 请求，而非单个 TrafficGen packet。
-- `--gpu-copy-mib > 64` 时，预留区会超过 `x86_board.py` E820 固定保留的顶部
-  64 MiB，可能覆盖 Linux 管理的 CXL 内存。
 - `--dma-copy` 模式同时启动两条无数据依赖的并发流量（读 DRAM + 写 CXL），并非
   真正的 DRAM→CXL copy。

@@ -35,7 +35,7 @@ requires(
 )
 
 parser = argparse.ArgumentParser(description='CXL Type-3 GPU DMA (Ruby).')
-parser.add_argument('--gpu-copy-mib', type=int, default=16)
+parser.add_argument('--gpu-copy-mib', type=int, default=512)
 parser.add_argument('--gpu-offered-bw', type=str, default="32GB/s")
 parser.add_argument('--gpu-request-size', type=int, choices=[64, 128, 256], default=64)
 parser.add_argument('--gpu-op', choices=['write', 'read'], default='write')
@@ -111,8 +111,18 @@ reserve_size = toMemorySize(args.cxl_test_reserve)
 cxl_size = cxl_dram.get_size()
 if copy_bytes > reserve_size:
     raise ValueError("gpu-copy-mib exceeds reserve")
+if reserve_size >= cxl_size:
+    raise ValueError("cxl-test-reserve must be smaller than cxl-size")
 cxl_test_start = CXL_BASE + cxl_size - reserve_size
 cxl_test_end = cxl_test_start + copy_bytes
+
+# x86_board.py 里 CXL 的 E820 默认只预留 64MiB，这里按 --cxl-test-reserve
+# 覆盖成实际预留大小，让 Linux 只看到 cxl_size - reserve_size，顶部留给测试。
+cxl_linux_visible = cxl_size - reserve_size
+for e in board.workload.e820_table.entries:
+    if e.addr == CXL_BASE and e.range_type == 20:
+        e.size = f"{cxl_linux_visible}B"
+        break
 
 offered_rate = toMemoryBandwidth(args.gpu_offered_bw)
 period = max(1, fromSeconds(block_size / offered_rate))
@@ -133,9 +143,12 @@ TICK_PER_SEC = 1e12
 
 POLL_TICKS = int(TICK_PER_SEC * 1e-6)  # poll every 1us
 
+# 写完成在 bytesWritten 累加，读完成在 bytesRead 累加（都在 recvTimingResp 里）。
+_completion_stat = "bytesWritten" if read_percent == 0 else "bytesRead"
 
-def _bytes_written():
-    return int(board.gpu_dma.resolveStat("bytesWritten").value)
+
+def _bytes_done():
+    return int(board.gpu_dma.resolveStat(_completion_stat).value)
 
 
 def handle_exit():
@@ -159,19 +172,20 @@ def handle_exit():
     # 在飞请求未返回，不能立刻计时。
     yield False
 
-    # 等待所有写响应返回（bytesWritten 在 recvTimingResp 里累加，代表真正
-    # 落库完成）。用 tick exit 反复轮询。
-    while _bytes_written() < copy_bytes:
+    # 等待所有写响应返回（bytesWritten/bytesRead 在 recvTimingResp 里累加，代表
+    # 真正落库完成）。用 tick exit 反复轮询。
+    while _bytes_done() < copy_bytes:
         m5.scheduleTickExitFromCurrent(POLL_TICKS)
         yield False
 
-    written = _bytes_written()
-    assert written == copy_bytes, \
-        f"bytesWritten {written} != copy_bytes {copy_bytes}"
+    done = _bytes_done()
+    assert done == copy_bytes, \
+        f"{_completion_stat} {done} != copy_bytes {copy_bytes}"
 
     elapsed = (m5.curTick() - t_start) / TICK_PER_SEC
+    op = 'read' if read_percent == 100 else 'write'
     print(f"[GPU->CXL (Ruby)] {copy_bytes} bytes in {elapsed:.6f}s "
-          f"= {copy_bytes / elapsed / 1e9:.2f} GB/s (write)")
+          f"= {copy_bytes / elapsed / 1e9:.2f} GB/s ({op})")
     m5.stats.dump()
     yield True
 
