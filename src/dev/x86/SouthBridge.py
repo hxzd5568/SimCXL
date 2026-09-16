@@ -105,10 +105,10 @@ class SouthBridge(SimObject):
             self.ide.dma = bus.cpu_side_ports
         # Optional PCIe/CXL accelerator devices are dynamically initialized
         # and attached by board classes.
-        attached_device = getattr(self, 'pcie_device', None)
-        if attached_device is None:
-            attached_device = getattr(self, 'cxl_device', None)
-        if attached_device is not None:
+        for dev_attr in ('pcie_device', 'cxl_device', 'simckpt_device'):
+            attached_device = getattr(self, dev_attr, None)
+            if attached_device is None:
+                continue
             attached_device.pio = bus.mem_side_ports
             if dma_ports.count(attached_device.dma) == 0:
                 attached_device.dma = bus.cpu_side_ports

@@ -120,7 +120,7 @@ cxl_test_end = cxl_test_start + copy_bytes
 # 覆盖成实际预留大小，让 Linux 只看到 cxl_size - reserve_size，顶部留给测试。
 cxl_linux_visible = cxl_size - reserve_size
 for e in board.workload.e820_table.entries:
-    if e.addr == CXL_BASE and e.range_type == 20:
+    if int(e.addr) == CXL_BASE and int(e.range_type) == 20:
         e.size = f"{cxl_linux_visible}B"
         break
 

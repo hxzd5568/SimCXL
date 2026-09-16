@@ -137,8 +137,8 @@ parser.add_argument(
 parser.add_argument(
     "--cxl-size",
     type=str,
-    default="8GB",
-    help="CXL Type-3 memory size",
+    default="1GB",
+    help="CXL Type-3 memory size (8-channel HBM_1000_4H_1x128 is 1GiB)",
 )
 
 parser.add_argument(
@@ -196,7 +196,8 @@ cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
 # Setup system memory and CXL memory
 memory = DIMM_DDR5_4400(size="3GB")
 # CXL 背板内存换成 HBM（128bit 宽通道），验证写带宽能否摆脱 DDR5-4400 的 ~5GB/s
-cxl_dram = ChanneledMemory(HBM_1000_4H_1x128, 8, 64, size="1GB")
+# 容量由 --cxl-size 控制（8 通道 HBM_1000_4H_1x128 物理容量为 1GiB）。
+cxl_dram = ChanneledMemory(HBM_1000_4H_1x128, 8, 64, size=args.cxl_size)
 
 # Setup Processor
 # Using KVM for fast boot, then switching to Timing/O3
@@ -284,7 +285,7 @@ else:
 # 覆盖成实际预留大小，让 Linux 只看到 cxl_size - reserve_size，顶部留给测试。
 cxl_linux_visible = cxl_size - reserve_size
 for e in board.workload.e820_table.entries:
-    if e.addr == CXL_BASE and e.range_type == 20:
+    if int(e.addr) == CXL_BASE and int(e.range_type) == 20:
         e.size = f"{cxl_linux_visible}B"
         break
 

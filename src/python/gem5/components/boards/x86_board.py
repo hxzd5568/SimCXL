@@ -43,6 +43,7 @@ from m5.objects import (
     Pc,
     Port,
     RawDiskImage,
+    SimCkptDevice,
     X86E820Entry,
     X86FsLinux,
     X86IntelMPBus,
@@ -82,9 +83,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cache_hierarchy: AbstractCacheHierarchy,
         cxl_memory: AbstractMemorySystem,
         is_asic: bool = True,
+        add_simckpt_device: bool = False,
     ) -> None:
         self._cxl_memory_ptr = cxl_memory
         self._is_asic = is_asic
+        self._add_simckpt_device = add_simckpt_device
 
         super().__init__(
             clk_freq=clk_freq,
@@ -105,6 +108,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         self.pc = Pc()
         # cxl_device is dynamically initialized and attached
         self.pc.south_bridge.cxl_device = CXLMemCtrl(pci_func=0, pci_dev=6, pci_bus=0)
+        if self._add_simckpt_device:
+            self.pc.south_bridge.simckpt_device = SimCkptDevice(
+                pci_func=0, pci_dev=7, pci_bus=0
+            )
 
         self.workload = X86FsLinux()
 
@@ -149,7 +156,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
         # Setup memory system specific settings.
         if self.get_cache_hierarchy().is_ruby():
-            self.pc.attachIO(self.get_io_bus(), [self.pc.south_bridge.ide.dma, cxl_mem_ctrl.dma])
+            dma_ports = [self.pc.south_bridge.ide.dma, cxl_mem_ctrl.dma]
+            if hasattr(self.pc.south_bridge, "simckpt_device"):
+                dma_ports.append(self.pc.south_bridge.simckpt_device.dma)
+            self.pc.attachIO(self.get_io_bus(), dma_ports)
         else:
             # # Constants similar to x86_traits.hh
             IO_address_space_base = 0x8000000000000000
@@ -311,8 +321,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
     @overrides(AbstractSystemBoard)
     def get_dma_ports(self) -> Sequence[Port]:
-        return [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports, 
+        ports = [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports, 
                 self.pc.south_bridge.cxl_device.dma]
+        if hasattr(self.pc.south_bridge, "simckpt_device"):
+            ports.append(self.pc.south_bridge.simckpt_device.dma)
+        return ports
 
     @overrides(AbstractSystemBoard)
     def has_coherent_io(self) -> bool:

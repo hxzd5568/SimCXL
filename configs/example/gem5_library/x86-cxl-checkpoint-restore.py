@@ -137,7 +137,7 @@ cxl_test_end = cxl_test_start + copy_bytes
 # widen it to the actual reserve so Linux does not use the test region.
 cxl_linux_visible = cxl_size - reserve_size
 for e in board.workload.e820_table.entries:
-    if e.addr == CXL_BASE and e.range_type == 20:
+    if int(e.addr) == CXL_BASE and int(e.range_type) == 20:
         e.size = f"{cxl_linux_visible}B"
         break
 

@@ -1,18 +1,4 @@
-# -*- mode:python -*-
-
-# Copyright (c) 2015 ARM Limited
-# All rights reserved.
-#
-# The license below extends only to copyright in the software and shall
-# not be construed as granting a license to any other intellectual
-# property including but not limited to intellectual property relating
-# to a hardware implementation of the functionality of the software
-# licensed hereunder.  You may use the software subject to the license
-# terms below provided that you ensure that this notice is replicated
-# unmodified and in its entirety in all distributions of the software,
-# modified or unmodified, in source code or in binary form.
-#
-# Copyright (c) 2006 The Regents of The University of Michigan
+# Copyright (c) 2021 The Regents of The University of California
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -38,35 +24,42 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-Import('*')
-
-# Controllers
-SimObject('Ide.py', sim_objects=['IdeDisk', 'IdeController'], enums=['IdeID'])
-
-Source('ide_ctrl.cc')
-Source('ide_disk.cc')
-
-DebugFlag('IdeCtrl')
-DebugFlag('IdeDisk')
-
-# Disk models
-SimObject('DiskImage.py', sim_objects=[
-    'DiskImage', 'RawDiskImage', 'CowDiskImage'])
-SimObject('SimpleDisk.py', sim_objects=['SimpleDisk'])
-
-Source('disk_image.cc')
-Source('simple_disk.cc')
-
-DebugFlag('DiskImageRead')
-DebugFlag('DiskImageWrite')
-DebugFlag('SimpleDisk')
-DebugFlag('SimpleDiskData')
-
-# AI-checkpoint DMA engine (SimCkptDevice)
-SimObject('SimCkpt.py', sim_objects=['SimCkptDevice'])
-Source('sim_ckpt_device.cc')
-DebugFlag('SimCkptDevice')
+from m5.params import *
+from m5.objects.PciDevice import PciDevice, PciMemBar
 
 
-CompoundFlag('DiskImageAll', [ 'DiskImageRead', 'DiskImageWrite' ])
-CompoundFlag('IdeAll', [ 'IdeCtrl', 'IdeDisk' ])
+class SimCkptDevice(PciDevice):
+    """AI-checkpoint DMA engine.
+
+    A PCI device exposing an NVMe-like submission/completion ring pair in host
+    memory plus a doorbell interface in BAR0. The device reads a source buffer,
+    computes a CRC32 over the payload, writes the payload to a destination
+    buffer, and only then posts a completion (optionally raising an interrupt).
+    """
+
+    type = "SimCkptDevice"
+    cxx_header = "dev/storage/sim_ckpt_device.hh"
+    cxx_class = "gem5::SimCkptDevice"
+
+    queue_depth = Param.Unsigned(
+        8, "Maximum number of descriptors processed concurrently"
+    )
+    max_chunk_size = Param.MemorySize(
+        "4KiB", "Maximum payload size of a single descriptor"
+    )
+    proc_lat = Param.Latency(
+        "15ns", "Per-descriptor processing latency before DMA issue"
+    )
+
+    VendorID = 0x8086
+    DeviceID = 0x9090
+    Command = 0x0
+    Status = 0x280
+    Revision = 0x0
+    ClassCode = 0x05
+    SubClassCode = 0x00
+    ProgIF = 0x00
+    InterruptLine = 0x11
+    InterruptPin = 0x01
+
+    BAR0 = PciMemBar(size="64KiB")
