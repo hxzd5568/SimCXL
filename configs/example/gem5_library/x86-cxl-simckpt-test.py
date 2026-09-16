@@ -34,6 +34,14 @@ requires(
     kvm_required=True,
 )
 
+import argparse
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--storage-channels", type=int, default=2,
+                     help="Number of ParallelStorage channels")
+_parser.add_argument("--bench-mib", type=int, default=0,
+                     help="Run a save bandwidth benchmark of this many MiB")
+_args, _ = _parser.parse_known_args()
+
 cache_hierarchy = MESITwoLevelCacheHierarchy(
     l1d_size="48kB",
     l1d_assoc=8,
@@ -65,6 +73,9 @@ board = X86Board(
     is_asic=True,
     add_simckpt_device=True,
 )
+board.simckpt_storage.num_channels = _args.storage_channels
+
+_bench_arg = f" {_args.bench_mib}" if _args.bench_mib > 0 else ""
 
 command = (
     "m5 exit;"                                  # switch KVM -> Timing
@@ -73,7 +84,7 @@ command = (
     + "echo 'no sysfs resource';"
     + "echo 1 > /sys/bus/pci/devices/0000:00:07.0/enable 2>/dev/null || "
     + "echo 'enable failed';"
-    + "/home/test_code/simckpt_test;"            # P1 functional test
+    + "/home/test_code/simckpt_test 0" + _bench_arg + ";"   # functional test
     + "m5 exit;"                                 # end
 )
 

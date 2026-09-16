@@ -24,46 +24,38 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from m5.objects.ClockedObject import ClockedObject
 from m5.params import *
-from m5.objects.PciDevice import PciDevice, PciMemBar
 
 
-class SimCkptDevice(PciDevice):
-    """AI-checkpoint DMA engine.
+class ParallelStorage(ClockedObject):
+    """Multi-channel flash-style backing store for AI checkpoints.
 
-    A PCI device exposing an NVMe-like submission/completion ring pair in host
-    memory plus a doorbell interface in BAR0. The device reads a source buffer,
-    computes a CRC32 over the payload, writes the payload to a destination
-    buffer, and only then posts a completion (optionally raising an interrupt).
+    Presents a single logical checkpoint namespace, striped across several
+    independent channels. Each channel has its own byte-addressable backing
+    store, read/write bandwidth, base latency, queue depth (outstanding
+    limit) and is serviced independently, so aggregate bandwidth scales with
+    the number of channels.
+
+    Stripping maps a logical byte offset to a channel:
+
+        chunk_id      = offset // chunk_size
+        channel       = chunk_id % num_channels
+        channel_off   = (chunk_id // num_channels) * chunk_size + offset % chunk_size
     """
 
-    type = "SimCkptDevice"
-    cxx_header = "dev/storage/sim_ckpt_device.hh"
-    cxx_class = "gem5::SimCkptDevice"
+    type = "ParallelStorage"
+    cxx_header = "dev/storage/parallel_storage.hh"
+    cxx_class = "gem5::ParallelStorage"
 
-    storage_port = RequestPort(
-        "Port to the ParallelStorage backend (save/restore)"
-    )
+    port = ResponsePort("This port sends responses and receives requests")
 
+    size = Param.MemorySize("64MiB", "Total logical checkpoint namespace size")
+    num_channels = Param.Unsigned(2, "Number of independent storage channels")
+    chunk_size = Param.MemorySize("4KiB", "Striping chunk size")
+    read_bw = Param.MemoryBandwidth("7GB/s", "Per-channel read bandwidth")
+    write_bw = Param.MemoryBandwidth("7GB/s", "Per-channel write bandwidth")
+    latency = Param.Latency("10us", "Per-channel base access latency")
     queue_depth = Param.Unsigned(
-        32, "Maximum number of descriptors processed concurrently"
+        32, "Per-channel maximum number of outstanding requests"
     )
-    max_chunk_size = Param.MemorySize(
-        "4KiB", "Maximum payload size of a single descriptor"
-    )
-    proc_lat = Param.Latency(
-        "15ns", "Per-descriptor processing latency before DMA issue"
-    )
-
-    VendorID = 0x8086
-    DeviceID = 0x9090
-    Command = 0x0
-    Status = 0x280
-    Revision = 0x0
-    ClassCode = 0x05
-    SubClassCode = 0x00
-    ProgIF = 0x00
-    InterruptLine = 0x11
-    InterruptPin = 0x01
-
-    BAR0 = PciMemBar(size="64KiB")

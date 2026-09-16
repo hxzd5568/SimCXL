@@ -1,18 +1,18 @@
 /*
- * SimCkptDevice P1 functional test (guest side).
+ * SimCkptDevice P2 functional test (guest side): parallel storage.
  *
- * Drives the gem5 SimCkptDevice PCI device directly through its BAR0 MMIO
- * registers (no kernel driver required), using a submission/completion ring
- * pair located in guest physical memory.
+ * Drives the SimCkptDevice through its BAR0 (no kernel driver) and exercises
+ * the full checkpoint save/restore path through the ParallelStorage backend:
  *
- * Two phases:
- *   phase 0  DRAM -> DRAM  (destination on NUMA node 0)
- *   phase 1  DRAM -> CXL   (destination bound to NUMA node 1 via mbind)
+ *   phase 0  SAVE    DRAM -> storage  (src on NUMA node 0)
+ *   phase 1  RESTORE storage -> DRAM   (dst on NUMA node 0)
+ *   phase 2  SAVE    CXL  -> storage  (src on NUMA node 1)
+ *   phase 3  RESTORE storage -> CXL    (dst on NUMA node 1)
  *
- * For each phase the test fills the source with a deterministic pattern,
- * writes descriptors into the SQ, rings the doorbell, waits for completions,
- * and then reads back the destination to verify the payload and per-chunk CRC
- * (readback test).
+ * Each phase submits `num_chunks` descriptors (chunk_size 4KiB) so the
+ * ParallelStorage stripes them across its channels. Data integrity is verified
+ * via the per-chunk CRC returned in each completion plus a byte-for-byte
+ * read-back of the restored destination.
  */
 
 #define _GNU_SOURCE
@@ -27,12 +27,16 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "virt2phy.h"
 
 #define DESC_SIZE 64
 #define CPL_SIZE 64
+
+#define FLAG_SAVE    1u
+#define FLAG_RESTORE 2u
 
 #define REG_CTRL        0x00
 #define REG_STATUS      0x08
@@ -146,6 +150,14 @@ fill_pattern(uint8_t *buf, size_t len, uint32_t ckpt, uint32_t chunk)
     }
 }
 
+static double
+now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + ts.tv_nsec;
+}
+
 struct Dev
 {
     volatile uint8_t *bar;
@@ -157,31 +169,13 @@ struct Dev
     }
 };
 
-/* Run one copy phase: src -> dst, verify payload + per-chunk CRC. */
-static int
-run_phase(Dev &dev, struct simckpt_desc *sq, struct simckpt_cpl *cq,
-          uint64_t sq_phys, uint64_t cq_phys, uint32_t sq_depth,
-          uint32_t cq_depth, uint8_t *src, uint8_t *dst,
-          uint32_t num_chunks, uint32_t chunk_len, uint32_t ckpt_id,
-          const char *tag)
+/* Submit `num_chunks` descriptors and wait for their completions. */
+static uint64_t
+submit_and_wait(Dev &dev, struct simckpt_desc *sq, struct simckpt_cpl *cq,
+                uint64_t sq_phys, uint64_t cq_phys, uint32_t sq_depth,
+                uint32_t cq_depth, uint32_t num_chunks)
 {
-    memset(sq, 0, sq_depth * DESC_SIZE);
-    memset(cq, 0, cq_depth * CPL_SIZE);
-
-    for (uint32_t c = 0; c < num_chunks; c++) {
-        uint8_t *s = src + (size_t)c * chunk_len;
-        uint8_t *d = dst + (size_t)c * chunk_len;
-        sq[c].src_addr = virt2phy2(s);
-        sq[c].dst_addr = virt2phy2(d);
-        sq[c].storage_offset = (uint64_t)c * chunk_len;
-        sq[c].length = chunk_len;
-        sq[c].checkpoint_id = ckpt_id;
-        sq[c].chunk_id = c;
-        sq[c].flags = 0;
-        sq[c].crc32 = crc32(s, chunk_len);
-    }
-
-    dev.wreg(REG_CTRL, 0x2);  /* CTRL_RESET: clear rings, counters */
+    dev.wreg(REG_CTRL, 0x2);  /* reset rings + counters */
     dev.wreg(REG_SQ_BASE, sq_phys);
     dev.wreg(REG_SQ_DEPTH, sq_depth);
     dev.wreg(REG_CQ_BASE, cq_phys);
@@ -195,19 +189,15 @@ run_phase(Dev &dev, struct simckpt_desc *sq, struct simckpt_cpl *cq,
         if (completed >= num_chunks)
             break;
     }
+    return completed;
+}
 
-    printf("[%s] completed=%" PRIu64 " (expected %u), intr_posted=%" PRIu64
-           ", errors=%" PRIu64 "\n",
-           tag, completed, num_chunks, dev.rreg(REG_INTR_POSTED),
-           dev.rreg(REG_ERRORS));
-
+/* Verify completions carry the expected per-chunk CRC (matched by chunk_id). */
+static int
+verify_crcs(struct simckpt_cpl *cq, const uint8_t *ref,
+            uint32_t num_chunks, uint32_t chunk_len, const char *tag)
+{
     int pass = 1;
-    if (completed != num_chunks) {
-        printf("[%s] FAIL: completion count mismatch\n", tag);
-        pass = 0;
-    }
-
-    /* Completions may complete out of order: match them by chunk_id. */
     bool seen[64] = {false};
     for (uint32_t i = 0; i < num_chunks; i++) {
         uint32_t c = cq[i].chunk_id;
@@ -218,16 +208,10 @@ run_phase(Dev &dev, struct simckpt_desc *sq, struct simckpt_cpl *cq,
             continue;
         }
         seen[c] = true;
-        const uint8_t *s = src + (size_t)c * chunk_len;
-        const uint8_t *d = dst + (size_t)c * chunk_len;
-        uint32_t expect = crc32(s, chunk_len);
+        uint32_t expect = crc32(ref + (size_t)c * chunk_len, chunk_len);
         if (cq[i].crc32 != expect) {
             printf("[%s] FAIL: chunk %u cpl crc=%#x expect=%#x\n",
                    tag, c, cq[i].crc32, expect);
-            pass = 0;
-        }
-        if (memcmp(s, d, chunk_len) != 0 || crc32(d, chunk_len) != expect) {
-            printf("[%s] FAIL: chunk %u destination mismatch\n", tag, c);
             pass = 0;
         }
     }
@@ -240,11 +224,84 @@ run_phase(Dev &dev, struct simckpt_desc *sq, struct simckpt_cpl *cq,
     return pass;
 }
 
+/* SAVE: memory -> storage. */
+static int
+run_save(Dev &dev, struct simckpt_desc *sq, struct simckpt_cpl *cq,
+         uint64_t sq_phys, uint64_t cq_phys, uint32_t sq_depth,
+         uint32_t cq_depth, uint8_t *src, uint32_t num_chunks,
+         uint32_t chunk_len, uint32_t ckpt_id, const char *tag)
+{
+    memset(sq, 0, sq_depth * DESC_SIZE);
+    memset(cq, 0, cq_depth * CPL_SIZE);
+    for (uint32_t c = 0; c < num_chunks; c++) {
+        sq[c].src_addr = virt2phy2(src + (size_t)c * chunk_len);
+        sq[c].storage_offset = (uint64_t)c * chunk_len;
+        sq[c].length = chunk_len;
+        sq[c].checkpoint_id = ckpt_id;
+        sq[c].chunk_id = c;
+        sq[c].flags = FLAG_SAVE;
+    }
+
+    uint64_t completed = submit_and_wait(dev, sq, cq, sq_phys, cq_phys,
+                                         sq_depth, cq_depth, num_chunks);
+    printf("[%s] completed=%" PRIu64 " (expected %u), intr_posted=%" PRIu64
+           ", errors=%" PRIu64 "\n", tag, completed, num_chunks,
+           dev.rreg(REG_INTR_POSTED), dev.rreg(REG_ERRORS));
+
+    int pass = (completed == num_chunks);
+    if (!pass)
+        printf("[%s] FAIL: completion count mismatch\n", tag);
+    pass &= verify_crcs(cq, src, num_chunks, chunk_len, tag);
+    return pass;
+}
+
+/* RESTORE: storage -> memory, then read back the destination. */
+static int
+run_restore(Dev &dev, struct simckpt_desc *sq, struct simckpt_cpl *cq,
+            uint64_t sq_phys, uint64_t cq_phys, uint32_t sq_depth,
+            uint32_t cq_depth, const uint8_t *src, uint8_t *dst,
+            uint32_t num_chunks, uint32_t chunk_len, uint32_t ckpt_id,
+            const char *tag)
+{
+    memset(sq, 0, sq_depth * DESC_SIZE);
+    memset(cq, 0, cq_depth * CPL_SIZE);
+    for (uint32_t c = 0; c < num_chunks; c++) {
+        sq[c].dst_addr = virt2phy2(dst + (size_t)c * chunk_len);
+        sq[c].storage_offset = (uint64_t)c * chunk_len;
+        sq[c].length = chunk_len;
+        sq[c].checkpoint_id = ckpt_id;
+        sq[c].chunk_id = c;
+        sq[c].flags = FLAG_RESTORE;
+    }
+
+    uint64_t completed = submit_and_wait(dev, sq, cq, sq_phys, cq_phys,
+                                         sq_depth, cq_depth, num_chunks);
+    printf("[%s] completed=%" PRIu64 " (expected %u), intr_posted=%" PRIu64
+           ", errors=%" PRIu64 "\n", tag, completed, num_chunks,
+           dev.rreg(REG_INTR_POSTED), dev.rreg(REG_ERRORS));
+
+    int pass = (completed == num_chunks);
+    if (!pass)
+        printf("[%s] FAIL: completion count mismatch\n", tag);
+    /* storage data == src, so the completion CRC must equal crc32(src). */
+    pass &= verify_crcs(cq, src, num_chunks, chunk_len, tag);
+
+    /* Read-back: restored destination must equal the original source. */
+    for (uint32_t c = 0; c < num_chunks; c++) {
+        if (memcmp(src + (size_t)c * chunk_len,
+                   dst + (size_t)c * chunk_len, chunk_len) != 0) {
+            printf("[%s] FAIL: chunk %u destination mismatch\n", tag, c);
+            pass = 0;
+        }
+    }
+    return pass;
+}
+
 int
 main(int argc, char **argv)
 {
-    const uint32_t num_chunks = 8;
-    const uint32_t chunk_len = 256;
+    const uint32_t num_chunks = 4;
+    const uint32_t chunk_len = 4096;
     const uint32_t sq_depth = 16;
     const uint32_t cq_depth = 16;
 
@@ -274,40 +331,42 @@ main(int argc, char **argv)
     Dev dev{bar};
 
     size_t total = (size_t)num_chunks * chunk_len;
-    uint8_t *src = (uint8_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
-                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    uint8_t *dram = (uint8_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
-                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    uint8_t *cxl = (uint8_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
-                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *dram_src = (uint8_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *dram_dst = (uint8_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *cxl_src = (uint8_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *cxl_dst = (uint8_t *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct simckpt_desc *sq = (struct simckpt_desc *)mmap(
         NULL, sq_depth * DESC_SIZE, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct simckpt_cpl *cq = (struct simckpt_cpl *)mmap(
         NULL, cq_depth * CPL_SIZE, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (src == MAP_FAILED || dram == MAP_FAILED || cxl == MAP_FAILED ||
+    if (dram_src == MAP_FAILED || dram_dst == MAP_FAILED ||
+        cxl_src == MAP_FAILED || cxl_dst == MAP_FAILED ||
         sq == MAP_FAILED || cq == MAP_FAILED) {
         perror("mmap buffers");
         return 1;
     }
 
-    memset(src, 0, total);
-    memset(dram, 0xAA, total);
-    memset(cxl, 0xAA, total);
+    memset(dram_src, 0, total);
+    memset(dram_dst, 0xAA, total);
+    memset(cxl_src, 0, total);
+    memset(cxl_dst, 0xAA, total);
     memset(sq, 0, sq_depth * DESC_SIZE);
     memset(cq, 0, cq_depth * CPL_SIZE);
 
-    for (uint32_t c = 0; c < num_chunks; c++)
-        fill_pattern(src + (size_t)c * chunk_len, chunk_len, 1, c);
-
-    /* Bind the "CXL" destination to NUMA node 1 (dax_kmem System RAM). */
-    unsigned long cxl_mask = 1UL << 1;
-    if (do_mbind(cxl, total, MPOL_BIND, &cxl_mask, 64,
-                 MPOL_MF_MOVE | MPOL_MF_STRICT) != 0) {
-        perror("mbind(cxl -> node 1)");
-        /* fall through: node 1 may not be onlined; phase 1 will just be DRAM */
+    for (uint32_t c = 0; c < num_chunks; c++) {
+        fill_pattern(dram_src + (size_t)c * chunk_len, chunk_len, 1, c);
+        fill_pattern(cxl_src + (size_t)c * chunk_len, chunk_len, 2, c);
     }
+
+    unsigned long node1 = 1UL << 1;
+    do_mbind(cxl_src, total, MPOL_BIND, &node1, 64, MPOL_MF_MOVE | MPOL_MF_STRICT);
+    do_mbind(cxl_dst, total, MPOL_BIND, &node1, 64, MPOL_MF_MOVE | MPOL_MF_STRICT);
 
     uint64_t sq_phys = virt2phy2(sq);
     uint64_t cq_phys = virt2phy2(cq);
@@ -316,14 +375,101 @@ main(int argc, char **argv)
         return 1;
     }
     printf("SQ phys=0x%" PRIx64 " CQ phys=0x%" PRIx64 "\n", sq_phys, cq_phys);
-    printf("cxl dst phys=0x%" PRIx64 "\n", virt2phy2(cxl));
 
     int pass = 1;
-    pass &= run_phase(dev, sq, cq, sq_phys, cq_phys, sq_depth, cq_depth,
-                      src, dram, num_chunks, chunk_len, 1, "DRAM->DRAM");
-    pass &= run_phase(dev, sq, cq, sq_phys, cq_phys, sq_depth, cq_depth,
-                      src, cxl, num_chunks, chunk_len, 2, "DRAM->CXL ");
+    pass &= run_save(dev, sq, cq, sq_phys, cq_phys, sq_depth, cq_depth,
+                     dram_src, num_chunks, chunk_len, 1, "SAVE DRAM->stor ");
+    pass &= run_restore(dev, sq, cq, sq_phys, cq_phys, sq_depth, cq_depth,
+                        dram_src, dram_dst, num_chunks, chunk_len, 1,
+                        "RESTORE stor->DRAM");
+    pass &= run_save(dev, sq, cq, sq_phys, cq_phys, sq_depth, cq_depth,
+                     cxl_src, num_chunks, chunk_len, 2, "SAVE CXL->stor  ");
+    pass &= run_restore(dev, sq, cq, sq_phys, cq_phys, sq_depth, cq_depth,
+                        cxl_src, cxl_dst, num_chunks, chunk_len, 2,
+                        "RESTORE stor->CXL ");
+
+    if (memcmp(dram_src, dram_dst, total) != 0) {
+        printf("FAIL: DRAM round-trip mismatch\n");
+        pass = 0;
+    } else {
+        printf("DRAM round-trip OK\n");
+    }
+    if (memcmp(cxl_src, cxl_dst, total) != 0) {
+        printf("FAIL: CXL round-trip mismatch\n");
+        pass = 0;
+    } else {
+        printf("CXL round-trip OK\n");
+    }
 
     printf("%s\n", pass ? "PASS" : "FAIL");
+
+    /* Optional bandwidth benchmark: argv[2] = save size in MiB. */
+    if (argc > 2) {
+        size_t bench_mib = strtoull(argv[2], NULL, 0);
+        const uint32_t bchunk_len = 4096;
+        uint32_t bchunks = (uint32_t)((bench_mib << 20) / bchunk_len);
+        if (bchunks == 0)
+            bchunks = 1;
+
+        size_t btotal = (size_t)bchunks * bchunk_len;
+        uint8_t *bsrc = (uint8_t *)mmap(NULL, btotal, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        uint32_t bsq_depth = bchunks;
+        uint32_t bcq_depth = bchunks;
+        struct simckpt_desc *bsq = (struct simckpt_desc *)mmap(
+            NULL, bsq_depth * DESC_SIZE, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        struct simckpt_cpl *bcq = (struct simckpt_cpl *)mmap(
+            NULL, bcq_depth * CPL_SIZE, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (bsrc == MAP_FAILED || bsq == MAP_FAILED || bcq == MAP_FAILED) {
+            fprintf(stderr, "bench mmap failed\n");
+            return pass ? 0 : 1;
+        }
+        memset(bsrc, 0, btotal);
+        memset(bsq, 0, bsq_depth * DESC_SIZE);
+        memset(bcq, 0, bcq_depth * CPL_SIZE);
+        for (uint32_t c = 0; c < bchunks; c++)
+            fill_pattern(bsrc + (size_t)c * bchunk_len, bchunk_len, 9, c);
+
+        uint64_t bsq_phys = virt2phy2(bsq);
+        uint64_t bcq_phys = virt2phy2(bcq);
+        if (bsq_phys == (uint64_t)-1 || bcq_phys == (uint64_t)-1) {
+            fprintf(stderr, "bench virt2phy failed\n");
+            return pass ? 0 : 1;
+        }
+
+        for (uint32_t c = 0; c < bchunks; c++) {
+            bsq[c].src_addr = virt2phy2(bsrc + (size_t)c * bchunk_len);
+            bsq[c].storage_offset = (uint64_t)c * bchunk_len;
+            bsq[c].length = bchunk_len;
+            bsq[c].checkpoint_id = 9;
+            bsq[c].chunk_id = c;
+            bsq[c].flags = FLAG_SAVE;
+        }
+
+        dev.wreg(REG_CTRL, 0x2);
+        dev.wreg(REG_SQ_BASE, bsq_phys);
+        dev.wreg(REG_SQ_DEPTH, bsq_depth);
+        dev.wreg(REG_CQ_BASE, bcq_phys);
+        dev.wreg(REG_CQ_DEPTH, bcq_depth);
+        dev.wreg(REG_INTR_EN, 0);
+
+        double t0 = now_ns();
+        dev.wreg(REG_SQ_DOORBELL, bchunks);
+        uint64_t bdone = 0;
+        for (int spins = 0; spins < 100000000; spins++) {
+            bdone = dev.rreg(REG_COMPLETED);
+            if (bdone >= bchunks)
+                break;
+        }
+        double t1 = now_ns();
+        double secs = (t1 - t0) / 1e9;
+        double gbps = (double)btotal / secs / 1e9;
+        printf("BENCH save %zu MiB (%u chunks): %.6f s = %.3f GB/s "
+               "(completed=%" PRIu64 ")\n",
+               bench_mib, bchunks, secs, gbps, bdone);
+    }
+
     return pass ? 0 : 1;
 }

@@ -2,12 +2,15 @@
 #define __DEV_STORAGE_SIM_CKPT_DEVICE_HH__
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <vector>
 
 #include "base/statistics.hh"
 #include "base/types.hh"
 #include "dev/pci/device.hh"
+#include "mem/packet.hh"
+#include "mem/request.hh"
 #include "params/SimCkptDevice.hh"
 #include "sim/eventq.hh"
 
@@ -43,6 +46,12 @@ class SimCkptDevice : public PciDevice
     // DMASequencer tracks sub-requests per cache line).
     static constexpr size_t DESC_SIZE = 64;
     static constexpr size_t CPL_SIZE = 64;
+
+    enum DescFlags : uint32_t
+    {
+        FLAG_SAVE    = 1 << 0,  // memory (src_addr) -> storage (storage_offset)
+        FLAG_RESTORE = 1 << 1,  // storage (storage_offset) -> memory (dst_addr)
+    };
 
     /** Descriptor layout in host memory (little-endian, packed to 64 B). */
     struct Descriptor
@@ -119,14 +128,51 @@ class SimCkptDevice : public PciDevice
         std::vector<uint8_t> dataBuf;
         Descriptor desc;
         uint32_t crc = 0;
+        bool save = true;   // save: memory->storage; restore: storage->memory
         Tick issueTick = 0;
 
         Slot(SimCkptDevice *dev, int idx);
     };
 
+    /**
+     * Point-to-point port to the ParallelStorage backend. Unlike the DMA port
+     * it does not split transfers into cache lines: the storage models
+     * bandwidth/latency per request (e.g. a 4 KiB flash page), so the whole
+     * payload is issued as a single request.
+     */
+    class StoragePort : public RequestPort
+    {
+      private:
+        SimCkptDevice *device;
+        RequestorID requestorId;
+
+        struct StorageState : public Packet::SenderState
+        {
+            Event *event;
+            StorageState(Event *e) : event(e) {}
+        };
+
+        std::deque<PacketPtr> pending;
+        bool blocked = false;
+
+        void trySend();
+
+      public:
+        StoragePort(const std::string &name, SimCkptDevice *dev);
+
+        void sendStorage(Packet::Command cmd, Addr addr, int size,
+                         uint8_t *data, Event *event);
+
+        bool recvTimingResp(PacketPtr pkt) override;
+        void recvReqRetry() override;
+    };
+
     const uint32_t queueDepth;
     const Addr maxChunkSize;
     const Tick procLat;
+
+    // Port to the ParallelStorage backend (save/restore).
+    StoragePort storagePort;
 
     // Registers (BAR0).
     uint64_t ctrl = 0;
@@ -143,6 +189,7 @@ class SimCkptDevice : public PciDevice
     bool intrEnable = false;
     uint64_t intrPosted = 0;
     uint64_t errorCount = 0;
+    bool execBusy = false;
 
     std::vector<std::unique_ptr<Slot>> slots;
 
@@ -157,6 +204,9 @@ class SimCkptDevice : public PciDevice
         statistics::Scalar numInterrupts;
         statistics::Scalar numErrors;
         statistics::Scalar numQueueFull;
+        statistics::Scalar firstIssueTick;
+        statistics::Scalar lastCompletionTick;
+        statistics::Formula execTicks;
     } stats;
 
     Addr barOffset(Addr addr) const;
@@ -171,6 +221,9 @@ class SimCkptDevice : public PciDevice
   public:
     using Params = SimCkptDeviceParams;
     explicit SimCkptDevice(const Params &p);
+
+    Port &getPort(const std::string &if_name,
+                  PortID idx = InvalidPortID) override;
 
     Tick read(PacketPtr pkt) override;
     Tick write(PacketPtr pkt) override;

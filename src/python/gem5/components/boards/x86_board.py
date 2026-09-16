@@ -40,6 +40,7 @@ from m5.objects import (
     CowDiskImage,
     IdeDisk,
     IOXBar,
+    ParallelStorage,
     Pc,
     Port,
     RawDiskImage,
@@ -111,6 +112,13 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         if self._add_simckpt_device:
             self.pc.south_bridge.simckpt_device = SimCkptDevice(
                 pci_func=0, pci_dev=7, pci_bus=0
+            )
+            self.simckpt_storage = ParallelStorage(
+                size="64MiB", num_channels=2, chunk_size="4KiB",
+                queue_depth=64
+            )
+            self.pc.south_bridge.simckpt_device.storage_port = (
+                self.simckpt_storage.port
             )
 
         self.workload = X86FsLinux()

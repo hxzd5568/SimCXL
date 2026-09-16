@@ -67,6 +67,11 @@ SimObject('SimCkpt.py', sim_objects=['SimCkptDevice'])
 Source('sim_ckpt_device.cc')
 DebugFlag('SimCkptDevice')
 
+# Parallel multi-channel flash storage
+SimObject('ParallelStorage.py', sim_objects=['ParallelStorage'])
+Source('parallel_storage.cc')
+DebugFlag('ParallelStorage')
+
 
 CompoundFlag('DiskImageAll', [ 'DiskImageRead', 'DiskImageWrite' ])
 CompoundFlag('IdeAll', [ 'IdeCtrl', 'IdeDisk' ])
