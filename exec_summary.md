@@ -131,6 +131,36 @@ GPU payload ──> DRAM / CXL（pinned pool）
   ```
   覆盖验收 #1（CRC 一致）与 #5（每 chunk 按 checkpoint_id/chunk_id 独立校验，乱序仍可恢复）。
 
+### P8：分析模型 + 周期仿真协同（已完成）
+- `analytical_model.py` —— Python 分析模型（借 LLMServingSim 工作负载级仿真思想），编码 P0/P2/P5 校准基线，输出**稳态保存带宽上界** `Bsave ≤ min(B_gpu→dram+B_gpu→cxl, B_dram→store+B_cxl→store, ΣB_channel)` 并快速扫描拓扑×通道数。
+- `trace_gen.{h,c}` —— 参数化 checkpoint trace 生成器（frequency/size/chunk_size/hot-cold 分布），Python 与 C **生成同一条 trace**，保证分析模型与周期仿真回放同一工作负载。
+- `trace_model.c` —— 宿主机纯 C 分析回放（同 `balancer_scale.c` 思路），512 MiB 全量 trace 毫秒级跑完，证明逻辑与数据量无关。
+- `bench/ckptbench_p8.c` + `configs/example/gem5_library/x86-cxl-ckptd-p8.py` —— 周期仿真抽样：驱动真实 SimCkptDevice 回放 trace，一次 boot 内采样 hot_frac 0.50 / 0.00 两个关键点，输出 4 项指标并与模型预测并排对比。
+- `src/dev/storage/sim_ckpt_device.{hh,cc}` —— 新增 `chunkLatency` 直方图统计（issue→completion 的每 chunk 硬件延迟），用于精确 P95（guest 时钟 ~1ms 量化，测不了亚 ms 延迟）。
+- 分析模型 Bsave 上界（GB/s，storage 为绑定项直到 4ch）：
+
+  | topology | 1ch | 2ch | 4ch | 8ch |
+  |---|---|---|---|---|
+  | dram | 7.2 | 14.4 | 28.8 | 29.0 |
+  | cxl | 7.2 | 14.4 | 20.0 | 20.0 |
+  | both | 7.2 | 14.4 | 28.8 | **49.0** |
+
+- 周期仿真 vs 分析模型（模型/实测并排，512 个 4 KiB chunk × 3 代）：
+
+  ```
+  [P8 metrics] (hot_frac 0.50)
+    save:      76.988 ms (0.041 GB/s)   [model 76.264 ms]   <- <1% 误差
+    per-ckpt:  25.663 ms (mean chunk 100.2 us)
+    resume:    13.998 ms               [model 15.848 ms]
+    hit-rate:  0.50                    [model 0.50]
+  [P8 metrics] (hot_frac 0.00)
+    resume:    25.996 ms               [model 27.112 ms]
+    hit-rate:  0.00                    [model 0.00]
+  PASS
+  ```
+- 关键结论：**串行路径瓶颈在 guest 软件而非硬件**。gem5 `chunkLatency` 直方图显示设备硬件每 chunk DMA 仅 **~10.7 µs**（P95 ≈ 10.75 µs，1920 样本落在同一 131 ns 桶内、极紧凑）；而 guest 可见每 chunk ~100 µs，差额 ~90 µs 全是软件开销（CRC32 + 每次提交都复位设备 + 门铃后忙轮询）。这给出 P9/P10 的优化方向：批量提交 / 多 DMA 队列 / 异步门铃 + 中断把软件开销从关键路径剥离。
+- 覆盖验收 #2（staging 带宽上界由分析模型给出）与 #8（每 chunk 硬件延迟经 `chunkLatency` 直方图独立统计）。
+
 ## 关键实现细节与踩坑
 
 1. **E820 override 比较**：`X86E820Entry.addr/range_type` 是 gem5 的 `Addr`/`UInt64` 对象，不能直接 `== int`，需 `int(e.addr)/int(e.range_type)`。
@@ -180,6 +210,9 @@ chmod +x /tmp/img/home/test_code/ckptbench && sync && umount /tmp/img
 | P5 | `configs/example/gem5_library/x86-cxl-ckptd-p5.py` | CXL 热备：命中率 0/25/50/100% 下恢复时间单调下降（#4） |
 | P6 | `configs/example/gem5_library/x86-cxl-ckptd-p6.py` | LLM 训练保存/故障/恢复：崩溃矩阵 + generation 回退 + 恢复验证 |
 | P7 | `configs/example/gem5_library/x86-cxl-ckptd-p7.py` | GPU payload 真实化：GPU→DRAM/CXL→storage→DRAM/CXL→GPU 往返 CRC32+SHA-256 一致 |
+| P8 | `python3 tests/cxl_tests/simckpt/analytical_model.py`（宿主机，无需 gem5） | Bsave 上界扫描 + trace 时间预测 |
+| P8 | `make trace_model && ./trace_model`（宿主机，全量 512 MiB） | 参数化 trace + 分析模型毫秒级回放、LRU 命中率 |
+| P8 | `configs/example/gem5_library/x86-cxl-ckptd-p8.py` | 周期仿真抽样：save/resume/hit-rate/P95 实测 vs 模型预测对比 |
 
 ```bash
 ./build/X86/gem5.opt -d m5out-p3 \

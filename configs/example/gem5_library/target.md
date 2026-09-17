@@ -279,11 +279,12 @@ P7：GPU payload 真实化 + 数据校验（已完成）
 2. 每 chunk CRC32 + 全 checkpoint SHA-256（调试模式逐字节比对）。
 3. 验证：GPU→DRAM/CXL→storage→DRAM/CXL→GPU 数据 CRC 一致（验收 #1、#5）。
 
-P8：分析模型 + 周期仿真协同（借 LLMServingSim）
+P8：分析模型 + 周期仿真协同（借 LLMServingSim）（已完成）
 1. Python 分析模型：用 P0 基线带宽预测 Bsave ≤ min(B_gpu→dram+B_gpu→cxl, B_dram→store+B_cxl→store, ΣB_channel)，快速扫描拓扑/分流策略。
 2. ckptbench 生成参数化 checkpoint trace（frequency/size/chunk_size/hot-cold 分布），仿 LLMServingSim 的 request trace。
 3. 周期仿真抽样验证分析模型的关键点。
 4. 指标：checkpoint 保存时间、恢复时间（time-to-resume）、保存带宽、热备命中率、每 chunk P95 延迟。
+   - 结果（见 exec_summary.md P8）：分析模型 `analytical_model.py` + 共享 trace 生成器 `trace_gen.{h,c}` + 宿主机回放 `trace_model.c` + 周期仿真 `ckptbench_p8.c`。save 实测 76.99 ms vs 模型 76.26 ms（<1%）；resume 冷/热 26.0/14.0 ms vs 模型 27.1/15.8 ms；hit-rate 精确吻合。设备新增 `chunkLatency` 直方图：硬件每 chunk DMA ~10.7 µs（P95≈10.75 µs），guest 可见 ~100 µs 差额为软件开销——指向 P9/P10 的批量提交/多队列优化。
 
 P9：拓扑与一致性增强（借 CXLMemSim）
 1. 显式拓扑对象：{GPU, DRAM pool, CXL pool, storage channels}，推导条带化与候选路径。
@@ -294,6 +295,20 @@ P10：多队列/多主机 + 完整验收
 1. 多 GPU DMA 队列；模型稳定后把 GPU DMA 与 storage DMA 拆成独立 PCI function。
 2. 多主机 CXL fabric、交换机、跨主机一致性放到后续阶段（当前 X86Board 只有一个 x86 系统 + 一个 CXLMemCtrl）。
 3. 跑完整验收矩阵 + 分链路统计（排队/带宽/延迟/重试）+ 论文级报告。
+
+【P8 实测发现：串行路径瓶颈在 guest 软件，应并入 P9/P10 优化项】
+- 现象：周期仿真里设备硬件每 chunk DMA 仅 ~10.7 µs（新增 `chunkLatency` 直方图，P95≈10.75 µs、1920 样本落在同一 131 ns 桶内）；但 guest 可见每 chunk 端到端 ~100 µs。差额 ~90 µs 是 guest 软件开销，而非硬件 DMA。
+- 根因（guest 侧，见 `tests/cxl_tests/simckpt/engine/libckpt.c`）：
+  1. 每次 `simckpt_save`/`simckpt_restore` 都走 `simckpt_submit`，它对设备写 `CTRL=0x2` 做**全量复位**（清 rings/counters 再重编程），一个 chunk 付一次复位/重编程代价；
+  2. `simckpt_wait` 用忙轮询读 `REG_COMPLETED`（无中断/无睡眠），每次轮询都是一次 BAR 读，挤占 CPU 关键路径；
+  3. `simckpt_crc32` 在 guest CPU（Timing 核）上串行计算 4 KiB，属软件计算延迟。
+- 这直接解释：为什么小数据量被 ~1ms 固定开销压垮（readme_cxl.md 结论 #1），以及为什么当前串行 path 的 save_bw 只有 ~0.04 GB/s、离 Bsave 上界（2ch=14.4 GB/s）差 3 个数量级。
+- 优化方向（P9/P10）：
+  1. **批量提交**：一次 doorbell 提交 N 个 descriptor（SQ 已支持多 entry，`queue_depth`>1 的 slots 可并行），摊薄复位/编程/轮询开销；
+  2. **中断驱动 + 异步门铃**：使能 `REG_INTR_EN` + `intrPost()`，guest 用 `SIMCKPT_IOC_WAIT` 睡眠等完成，而非忙轮询；
+  3. **CRC 卸载**：把 CRC32 留在设备（设备已算），guest 侧 `simckpt_crc32` 仅用于校验、可移出保存关键路径或改批量；
+  4. **多 DMA 队列**（P10 #1）：每 lane 独立 engine，去掉单引擎串行化。
+- 验证该问题已被解决的判据：批量/异步后，guest 可见每 chunk 端到端延迟应趋近 ~10.7 µs 硬件下界，save_bw 应显著向 Bsave 上界靠近（不再是 latency-bound 的 ~0.04 GB/s）。
 八、第一版的验收标准
 第一版不用追求NVMe协议级精度，但应满足：
 1. GPU→DRAM/CXL→storage→DRAM/CXL→GPU 数据CRC一致。

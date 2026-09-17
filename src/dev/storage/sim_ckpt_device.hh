@@ -207,6 +207,7 @@ class SimCkptDevice : public PciDevice
         statistics::Scalar firstIssueTick;
         statistics::Scalar lastCompletionTick;
         statistics::Formula execTicks;
+        statistics::Histogram chunkLatency;   // per-chunk completion latency
     } stats;
 
     Addr barOffset(Addr addr) const;

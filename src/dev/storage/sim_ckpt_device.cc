@@ -77,9 +77,12 @@ SimCkptDevice::CkptStats::CkptStats(SimCkptDevice &dev)
       ADD_STAT(lastCompletionTick, statistics::units::Tick::get(),
                "Tick of last completion"),
       ADD_STAT(execTicks, statistics::units::Tick::get(),
-               "Execution ticks (last completion - first issue)")
+               "Execution ticks (last completion - first issue)"),
+      ADD_STAT(chunkLatency, statistics::units::Tick::get(),
+               "Per-chunk completion latency (issue -> completion)")
 {
     execTicks = lastCompletionTick - firstIssueTick;
+    chunkLatency.init(100);
 }
 
 SimCkptDevice::Slot::Slot(SimCkptDevice *dev, int idx)
@@ -343,6 +346,7 @@ SimCkptDevice::onDmaDone(int idx)
         stats.numBytesWritten += slot.desc.length;
         completedCount++;
         stats.numDescCompleted++;
+        stats.chunkLatency.sample(curTick() - slot.issueTick);
         if (intrEnable) {
             intrPost();
             intrPosted++;

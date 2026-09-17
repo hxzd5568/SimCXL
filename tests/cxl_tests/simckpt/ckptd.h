@@ -17,8 +17,22 @@
 #define CKPT_MAX_CHUNKS 4096
 #define CKPT_SOURCE_DISK     0
 #define CKPT_SOURCE_CXL_HOT  1
-#define CKPT_STATE_WRITING   0
-#define CKPT_STATE_COMMITTED 1
+
+/* Chunk lifecycle state machine (target.md section 9, CXLMemSim coherency
+ * state-machine idea):
+ *   FREE -> PINNED -> IN_FLIGHT -> DISK_COMMITTED -> HOT -> EVICTABLE -> FREE
+ *   (HOT/EVICTABLE are only entered when the chunk is kept in the CXL hot
+ *    standby; otherwise DISK_COMMITTED can go straight back to FREE.) */
+#define CKPT_STATE_FREE           0
+#define CKPT_STATE_PINNED         1
+#define CKPT_STATE_IN_FLIGHT      2
+#define CKPT_STATE_DISK_COMMITTED 3
+#define CKPT_STATE_HOT            4
+#define CKPT_STATE_EVICTABLE      5
+
+/* Backward-compatible aliases used by earlier phases. */
+#define CKPT_STATE_WRITING   CKPT_STATE_IN_FLIGHT
+#define CKPT_STATE_COMMITTED CKPT_STATE_DISK_COMMITTED
 
 struct chunk_meta {
     uint64_t checkpoint_id;
@@ -31,6 +45,7 @@ struct chunk_meta {
 } __attribute__((packed));
 
 struct ckpt_manifest {
+    uint64_t version;               /* monotonic manifest version        */
     uint64_t current_gen;           /* generation of the in-flight ckpt   */
     uint64_t committed_gen;         /* last fully-committed generation    */
     uint32_t num_chunks;            /* chunks recorded so far             */
@@ -61,6 +76,23 @@ void ckpt_manifest_finish(struct ckpt_manifest *m);
 
 /* Roll back an in-flight checkpoint to the previous generation. */
 void ckpt_manifest_rollback(struct ckpt_manifest *m);
+
+/* --- chunk lifecycle state machine -------------------------------------- */
+/* Return / set the state of a chunk by chunk_id (current generation). */
+uint8_t ckpt_chunk_state(const struct ckpt_manifest *m, uint32_t chunk_id);
+int ckpt_chunk_set_state(struct ckpt_manifest *m, uint32_t chunk_id,
+                         uint8_t state);
+
+/* Named transitions (no-ops are allowed and return 0; invalid transitions
+ * return -1). */
+int ckpt_chunk_pin(struct ckpt_manifest *m, uint32_t chunk_id);
+int ckpt_chunk_promote_hot(struct ckpt_manifest *m, uint32_t chunk_id);
+int ckpt_chunk_evictable(struct ckpt_manifest *m, uint32_t chunk_id);
+int ckpt_chunk_free(struct ckpt_manifest *m, uint32_t chunk_id);
+
+/* Count chunks in each state (STATE_COUNT = CKPT_STATE_EVICTABLE+1). */
+void ckpt_manifest_state_counts(const struct ckpt_manifest *m,
+                                uint32_t counts[CKPT_STATE_EVICTABLE + 1]);
 
 /* --- pinned pool ------------------------------------------------------- */
 /* Allocate `size` bytes bound to NUMA node `node` (0 = DRAM, 1 = CXL). */

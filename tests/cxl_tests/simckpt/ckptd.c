@@ -62,7 +62,7 @@ ckpt_manifest_add(struct ckpt_manifest *m, uint32_t chunk_id,
     c->length = length;
     c->crc32 = crc;
     c->source = source;
-    c->state = CKPT_STATE_WRITING;
+    c->state = CKPT_STATE_IN_FLIGHT;
     return 0;
 }
 
@@ -71,7 +71,7 @@ ckpt_manifest_commit(struct ckpt_manifest *m, uint32_t chunk_id)
 {
     for (uint32_t i = 0; i < m->num_chunks; i++) {
         if (m->chunks[i].chunk_id == chunk_id) {
-            m->chunks[i].state = CKPT_STATE_COMMITTED;
+            m->chunks[i].state = CKPT_STATE_DISK_COMMITTED;
             return 0;
         }
     }
@@ -93,6 +93,7 @@ void
 ckpt_manifest_finish(struct ckpt_manifest *m)
 {
     m->committed_gen = m->current_gen;
+    m->version++;
 }
 
 void
@@ -101,6 +102,80 @@ ckpt_manifest_rollback(struct ckpt_manifest *m)
     /* Discard the in-flight generation; committed_gen stays put. */
     m->current_gen = m->committed_gen;
     m->num_chunks = 0;
+}
+
+/* --- chunk lifecycle state machine -------------------------------------- */
+static int
+find_chunk(const struct ckpt_manifest *m, uint32_t chunk_id)
+{
+    for (uint32_t i = 0; i < m->num_chunks; i++)
+        if (m->chunks[i].chunk_id == chunk_id)
+            return (int)i;
+    return -1;
+}
+
+uint8_t
+ckpt_chunk_state(const struct ckpt_manifest *m, uint32_t chunk_id)
+{
+    int i = find_chunk(m, chunk_id);
+    return (i < 0) ? CKPT_STATE_FREE : m->chunks[i].state;
+}
+
+int
+ckpt_chunk_set_state(struct ckpt_manifest *m, uint32_t chunk_id, uint8_t state)
+{
+    int i = find_chunk(m, chunk_id);
+    if (i < 0)
+        return -1;
+    m->chunks[i].state = state;
+    return 0;
+}
+
+static int
+transition(struct ckpt_manifest *m, uint32_t chunk_id, uint8_t from,
+           uint8_t to)
+{
+    if (ckpt_chunk_state(m, chunk_id) == from)
+        return ckpt_chunk_set_state(m, chunk_id, to);
+    return -1;
+}
+
+int
+ckpt_chunk_pin(struct ckpt_manifest *m, uint32_t chunk_id)
+{
+    return transition(m, chunk_id, CKPT_STATE_FREE, CKPT_STATE_PINNED);
+}
+
+int
+ckpt_chunk_promote_hot(struct ckpt_manifest *m, uint32_t chunk_id)
+{
+    return transition(m, chunk_id, CKPT_STATE_DISK_COMMITTED, CKPT_STATE_HOT);
+}
+
+int
+ckpt_chunk_evictable(struct ckpt_manifest *m, uint32_t chunk_id)
+{
+    return transition(m, chunk_id, CKPT_STATE_HOT, CKPT_STATE_EVICTABLE);
+}
+
+int
+ckpt_chunk_free(struct ckpt_manifest *m, uint32_t chunk_id)
+{
+    uint8_t s = ckpt_chunk_state(m, chunk_id);
+    if (s == CKPT_STATE_EVICTABLE || s == CKPT_STATE_DISK_COMMITTED ||
+        s == CKPT_STATE_FREE)
+        return ckpt_chunk_set_state(m, chunk_id, CKPT_STATE_FREE);
+    return -1;
+}
+
+void
+ckpt_manifest_state_counts(const struct ckpt_manifest *m,
+                           uint32_t counts[CKPT_STATE_EVICTABLE + 1])
+{
+    for (int s = 0; s <= CKPT_STATE_EVICTABLE; s++)
+        counts[s] = 0;
+    for (uint32_t i = 0; i < m->num_chunks; i++)
+        counts[m->chunks[i].state]++;
 }
 
 /* --- pinned pool ------------------------------------------------------- */

@@ -11,7 +11,8 @@ INCLUDES = -Iinclude -Iengine -I.
 LIB_SRC = engine/libckpt.c ckptd.c
 ENG_SRC = engine/gpu_dma_engine.c engine/sha256.c
 
-all: ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7
+all: ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 \
+	ckptbench_p8 trace_model
 
 ckptbench: bench/ckptbench.c $(LIB_SRC) engine/libckpt.h ckptd.h include/simckpt_uapi.h
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench.c $(LIB_SRC)
@@ -33,10 +34,21 @@ ckptbench_p7: bench/ckptbench_p7.c $(LIB_SRC) $(ENG_SRC) \
 		engine/gpu_dma_engine.h engine/sha256.h
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_p7.c $(LIB_SRC) $(ENG_SRC)
 
+ckptbench_p8: bench/ckptbench_p8.c $(LIB_SRC) engine/gpu_dma_engine.c \
+		trace_gen.c engine/libckpt.h ckptd.h include/simckpt_uapi.h \
+		engine/gpu_dma_engine.h trace_gen.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_p8.c $(LIB_SRC) \
+		engine/gpu_dma_engine.c trace_gen.c -lm
+
 # Host-side unit test: prove the balancer routes a full-size (512 MiB)
 # checkpoint without running gem5 (pure C, milliseconds).
 balancer_scale: balancer_scale.c balancer.c balancer.h
 	$(CC) -O2 -Wall -I. -o $@ balancer_scale.c balancer.c
+
+# Host-side analytical model replay: parameterized checkpoint trace + model
+# at full scale, no gem5 (P8).
+trace_model: trace_model.c trace_gen.c trace_gen.h
+	$(CC) -O2 -Wall -I. -o $@ trace_model.c trace_gen.c -lm
 
 # Kernel module. The guest kernel is a custom 6.12.0+ image whose headers are
 # not shipped in the disk image (only 4.15 headers are present), so this target
@@ -48,7 +60,8 @@ module:
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/driver modules
 
 clean:
-	rm -f ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 balancer_scale
+	rm -f ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 \
+		ckptbench_p8 balancer_scale trace_model
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/driver clean 2>/dev/null || true
 
 .PHONY: all module clean
