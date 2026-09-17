@@ -9,8 +9,9 @@ CFLAGS  ?= -O2 -static -Wall
 INCLUDES = -Iinclude -Iengine -I.
 
 LIB_SRC = engine/libckpt.c ckptd.c
+ENG_SRC = engine/gpu_dma_engine.c engine/sha256.c
 
-all: ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6
+all: ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7
 
 ckptbench: bench/ckptbench.c $(LIB_SRC) engine/libckpt.h ckptd.h include/simckpt_uapi.h
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench.c $(LIB_SRC)
@@ -27,6 +28,11 @@ ckptbench_p6: bench/ckptbench_p6.c $(LIB_SRC) \
 		engine/libckpt.h ckptd.h include/simckpt_uapi.h
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_p6.c $(LIB_SRC)
 
+ckptbench_p7: bench/ckptbench_p7.c $(LIB_SRC) $(ENG_SRC) \
+		engine/libckpt.h ckptd.h include/simckpt_uapi.h \
+		engine/gpu_dma_engine.h engine/sha256.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_p7.c $(LIB_SRC) $(ENG_SRC)
+
 # Host-side unit test: prove the balancer routes a full-size (512 MiB)
 # checkpoint without running gem5 (pure C, milliseconds).
 balancer_scale: balancer_scale.c balancer.c balancer.h
@@ -42,7 +48,7 @@ module:
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/driver modules
 
 clean:
-	rm -f ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 balancer_scale
+	rm -f ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 balancer_scale
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/driver clean 2>/dev/null || true
 
 .PHONY: all module clean

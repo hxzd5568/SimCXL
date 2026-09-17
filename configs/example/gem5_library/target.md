@@ -274,7 +274,7 @@ P6：故障注入
 2. 只有 manifest 标记 COMMITTED 的 generation 可恢复，未完成版本回退到前一个 generation。
 3. 并发恢复：storage→DRAM 与 storage→CXL 同时恢复。
 
-P7：GPU payload 真实化 + 数据校验
+P7：GPU payload 真实化 + 数据校验（已完成）
 1. GpuDmaEngine 生成可复现 payload：payload[i] = PRNG(checkpoint_id, chunk_id, i)。
 2. 每 chunk CRC32 + 全 checkpoint SHA-256（调试模式逐字节比对）。
 3. 验证：GPU→DRAM/CXL→storage→DRAM/CXL→GPU 数据 CRC 一致（验收 #1、#5）。

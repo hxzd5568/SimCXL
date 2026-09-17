@@ -1,6 +1,6 @@
-# SimCXL AI Checkpoint — 执行总结（P0–P6）
+# SimCXL AI Checkpoint — 执行总结（P0–P7）
 
-本文记录 SimCXL AI checkpoint 项目（`configs/example/gem5_library/target.md`）P0–P6 的实现结果、关键实现细节、测试方法，以及借鉴其他两个库（CXLMemSim / LLMServingSim）的落点。
+本文记录 SimCXL AI checkpoint 项目（`configs/example/gem5_library/target.md`）P0–P7 的实现结果、关键实现细节、测试方法，以及借鉴其他两个库（CXLMemSim / LLMServingSim）的落点。
 
 ## 概述
 
@@ -113,6 +113,24 @@ GPU payload ──> DRAM / CXL（pinned pool）
   ```
   崩溃于 gen 3（只写了 2/256 chunk）→ manifest 回退到 gen 2 → 恢复 gen 2 逐字节校验 OK。
 
+### P7：GPU payload 真实化 + 数据校验（已完成）
+- `engine/gpu_dma_engine.{h,c}` —— 用户态 GPU DMA 引擎仿真：`payload[i] = PRNG(checkpoint_id, chunk_id, i)`（32-bit fp32 张量元素的高字节），可复现、无需保存参考副本即可校验。
+- `engine/sha256.{h,c}` —— 自包含 SHA-256（FIPS 180-4，用 `abc`/空串测试向量验证），用于整 checkpoint 摘要。
+- `bench/ckptbench_p7.c` —— 完整往返 GPU→DRAM/CXL→storage→DRAM/CXL→GPU：每 chunk CRC32（设备计算 + 恢复交叉校验）+ 全 checkpoint SHA-256 + GPU 端重生成逐字节比对。
+- 测试结果：
+  ```
+  [DRAM] save 24.996 ms (256 chunks), restore 25.996 ms
+         per-chunk CRC32: OK | full SHA-256: OK | GPU recheck: OK
+         sha256=88da24b2...a5567125
+  [CXL]  save 24.996 ms (256 chunks), restore 25.996 ms
+         per-chunk CRC32: OK | full SHA-256: OK | GPU recheck: OK
+         sha256=92b4171b...266c0a95
+  counters: completed=1 errors=0 intr=0
+  gpu engine: generated=2097152B verified=2097152B mismatches=0
+  PASS
+  ```
+  覆盖验收 #1（CRC 一致）与 #5（每 chunk 按 checkpoint_id/chunk_id 独立校验，乱序仍可恢复）。
+
 ## 关键实现细节与踩坑
 
 1. **E820 override 比较**：`X86E820Entry.addr/range_type` 是 gem5 的 `Addr`/`UInt64` 对象，不能直接 `== int`，需 `int(e.addr)/int(e.range_type)`。
@@ -161,6 +179,7 @@ chmod +x /tmp/img/home/test_code/ckptbench && sync && umount /tmp/img
 | P4 | `configs/example/gem5_library/x86-cxl-ckptd-p4.py` | 分流（headroom 路由、双 lane 使用）+ 压力控制（pool 状态机、pinned_bytes 不增长） |
 | P5 | `configs/example/gem5_library/x86-cxl-ckptd-p5.py` | CXL 热备：命中率 0/25/50/100% 下恢复时间单调下降（#4） |
 | P6 | `configs/example/gem5_library/x86-cxl-ckptd-p6.py` | LLM 训练保存/故障/恢复：崩溃矩阵 + generation 回退 + 恢复验证 |
+| P7 | `configs/example/gem5_library/x86-cxl-ckptd-p7.py` | GPU payload 真实化：GPU→DRAM/CXL→storage→DRAM/CXL→GPU 往返 CRC32+SHA-256 一致 |
 
 ```bash
 ./build/X86/gem5.opt -d m5out-p3 \
