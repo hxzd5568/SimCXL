@@ -41,3 +41,4 @@ Doxygen.config
 typings
 include/cxl_benchmark/lmbench3
 /output
+m5out-*/

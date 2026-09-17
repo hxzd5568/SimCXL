@@ -101,4 +101,20 @@ void ckpt_pool_free_from(struct ckpt_pool *p, void *buf, size_t size);
  * 90..95 SHRINK, >95 STOPPED. */
 void ckpt_pool_update(struct ckpt_pool *p, int pressure_pct);
 
+/* --- CXL hot standby --------------------------------------------------- */
+/* CXL keeps a hot subset of the checkpoint (most recently used / highest
+ * recovery-cost chunks) as a *cache* of the durable storage copy (borrows
+ * CXLMemSim coherency engine's sharer/dirty idea). A restore that hits CXL
+ * avoids the slow storage read.
+ */
+struct ckpt_hot_standby {
+    uint32_t capacity;               /* max hot chunks (LRU eviction)     */
+    uint32_t num_hot;
+    uint32_t order[CKPT_MAX_CHUNKS]; /* hot chunk ids, 0 = most recent    */
+};
+
+void ckpt_hot_init(struct ckpt_hot_standby *h, uint32_t capacity);
+int ckpt_hot_is_hot(const struct ckpt_hot_standby *h, uint32_t chunk_id);
+void ckpt_hot_add(struct ckpt_hot_standby *h, uint32_t chunk_id);
+
 #endif /* CKPTD_H */

@@ -1,6 +1,6 @@
-# SimCXL AI Checkpoint — 执行总结（P0–P4）
+# SimCXL AI Checkpoint — 执行总结（P0–P6）
 
-本文记录 SimCXL AI checkpoint 项目（`configs/example/gem5_library/target.md`）P0–P4 的实现结果、关键实现细节、测试方法，以及借鉴其他两个库（CXLMemSim / LLMServingSim）的落点。
+本文记录 SimCXL AI checkpoint 项目（`configs/example/gem5_library/target.md`）P0–P6 的实现结果、关键实现细节、测试方法，以及借鉴其他两个库（CXLMemSim / LLMServingSim）的落点。
 
 ## 概述
 
@@ -87,6 +87,32 @@ GPU payload ──> DRAM / CXL（pinned pool）
   ```
 - 说明：验收 #2（双内存路径 staging 带宽 > 最快单路径）指的是 **GPU→DRAM/CXL 的 staging 写入带宽**（用于降低 GPU stall，而非 storage 落盘吞吐）。它由 GpuDmaEngine（P7）建模，且两路并行 staging 需要每 lane 独立的 DMA 引擎（P10「多 GPU DMA 队列」）；当前设备只实现了 persist 路径（DRAM/CXL→storage），storage 是瓶颈（2 通道 ~11.5 GB/s），与 #2 的 staging 指标无关。
 
+### P5：CXL 热备（hot standby）（已完成）
+- `ckptd.{h,c}` 增加 **热备管理器**（借 CXLMemSim 一致性引擎 sharer/dirty 思想）：CXL 保留最近 checkpoint 的热 chunk 作为磁盘副本的**缓存**（LRU 淘汰），命中走 CXL 快路径、未命中走 storage 慢路径。
+- `bench/ckptbench_p5.c` —— 测试：save 512 个 chunk 到 storage + CXL 热备，然后按命中率 0/25/50/100% 恢复并计时。
+- 测试结果（restore 时间随命中率单调下降，验收 #4）：
+  ```
+  [hot   0%] restore 512 chunks: 52.992 ms (OK)   ← 全冷：storage DMA
+  [hot  25%] restore 512 chunks: 40.994 ms (OK)
+  [hot  50%] restore 512 chunks: 28.996 ms (OK)
+  [hot 100%] restore 512 chunks:  6.999 ms (OK)   ← 全热：CXL memcpy
+  ```
+  100% 命中比 0% 命中快 ~7.6×，且每次恢复都逐字节校验 OK。
+
+### P6：LLM 训练保存/故障/恢复（应用层，已完成）
+- `bench/ckptbench_p6.c` —— 应用层模拟（借 LLMServingSim 工作负载级思想）：模型状态用确定性函数 `model[i]=PRNG(step,i)` 表示，训练循环周期性保存 checkpoint，故障注入（写到一半崩溃），重启后从 manifest 恢复最后一个 COMMITTED 代际。
+- 崩溃矩阵（P6-1）+ generation 回退（P6-2）都在应用层实现；并发恢复（P6-3）推迟到 P10 多 DMA 引擎。
+- 测试结果：
+  ```
+  [train] checkpoint gen=1 (step 10) committed
+  [train] checkpoint gen=2 (step 20) committed
+  [train] FAULT: crashed mid-checkpoint gen=3 after 2/256 chunks
+  [train] manifest persisted: committed_gen=2 (step 20)
+  [recover] manifest: committed_gen=2 (step 20)
+  [recover] restored gen=2 in 26.996 ms -> VERIFIED OK
+  ```
+  崩溃于 gen 3（只写了 2/256 chunk）→ manifest 回退到 gen 2 → 恢复 gen 2 逐字节校验 OK。
+
 ## 关键实现细节与踩坑
 
 1. **E820 override 比较**：`X86E820Entry.addr/range_type` 是 gem5 的 `Addr`/`UInt64` 对象，不能直接 `== int`，需 `int(e.addr)/int(e.range_type)`。
@@ -98,6 +124,7 @@ GPU payload ──> DRAM / CXL（pinned pool）
 7. **复位与计数语义**：`SimCkptDevice` 的 `CTRL=0x2` 复位会清零 `completedCount`；libckpt 每批提交都复位，用“自复位起 n 个完成”计数。
 8. **多代 checkpoint 存储布局**：每代放在 `gen * checkpoint_size` 的独立存储基址，避免覆盖；manifest 用 `expected_chunks` 判定完整性（缺块即视为未完成）。
 9. **内核模块无法在本环境编译**：guest 内核是定制 6.12.0+，disk image 只带 4.15 头文件；`simckpt.ko` 作为参考实现，测试走 libckpt 的 `/dev/mem` 回退路径（同一 ABI）。
+10. **Ruby directory 的 DMA 一致性 assert**：restore 写回 DRAM 时，若目标物理页与之前某次 save 读过的物理页复用（跨进程 crash/restart 后 malloc 复用同一物理页），Ruby directory 会命中 `MESI_Two_Level-dir.sm` 的 `assert(is_valid(tbe))`（`da_sendDMAAck`）。规避：恢复目标放到 CXL node（不同地址空间/不同 directory），或避免跨进程物理页复用。
 
 ## 测试方法
 
@@ -132,6 +159,8 @@ chmod +x /tmp/img/home/test_code/ckptbench && sync && umount /tmp/img
 | P1/P2 | `configs/example/gem5_library/x86-cxl-simckpt-test.py`（`--storage-channels N --bench-mib M`） | MemCopy 语义、CRC、乱序完成、条带均分、双通道 vs 单通道带宽 |
 | P3 | `configs/example/gem5_library/x86-cxl-ckptd-test.py` | libckpt+ckptd 往返 CRC 一致、manifest generation 回退 |
 | P4 | `configs/example/gem5_library/x86-cxl-ckptd-p4.py` | 分流（headroom 路由、双 lane 使用）+ 压力控制（pool 状态机、pinned_bytes 不增长） |
+| P5 | `configs/example/gem5_library/x86-cxl-ckptd-p5.py` | CXL 热备：命中率 0/25/50/100% 下恢复时间单调下降（#4） |
+| P6 | `configs/example/gem5_library/x86-cxl-ckptd-p6.py` | LLM 训练保存/故障/恢复：崩溃矩阵 + generation 回退 + 恢复验证 |
 
 ```bash
 ./build/X86/gem5.opt -d m5out-p3 \

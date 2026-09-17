@@ -177,3 +177,44 @@ ckpt_pool_update(struct ckpt_pool *p, int pressure_pct)
     else
         p->state = POOL_NORMAL;
 }
+
+/* --- CXL hot standby --------------------------------------------------- */
+void
+ckpt_hot_init(struct ckpt_hot_standby *h, uint32_t capacity)
+{
+    h->capacity = capacity;
+    h->num_hot = 0;
+}
+
+int
+ckpt_hot_is_hot(const struct ckpt_hot_standby *h, uint32_t chunk_id)
+{
+    for (uint32_t i = 0; i < h->num_hot; i++)
+        if (h->order[i] == chunk_id)
+            return 1;
+    return 0;
+}
+
+void
+ckpt_hot_add(struct ckpt_hot_standby *h, uint32_t chunk_id)
+{
+    /* Remove an existing entry for chunk_id (if any). */
+    for (uint32_t i = 0; i < h->num_hot; i++) {
+        if (h->order[i] == chunk_id) {
+            for (uint32_t j = i; j + 1 < h->num_hot; j++)
+                h->order[j] = h->order[j + 1];
+            h->num_hot--;
+            break;
+        }
+    }
+
+    /* Insert at the front (most recent). */
+    for (uint32_t i = h->num_hot; i > 0; i--)
+        h->order[i] = h->order[i - 1];
+    h->order[0] = chunk_id;
+    h->num_hot++;
+
+    /* LRU eviction. */
+    if (h->num_hot > h->capacity)
+        h->num_hot = h->capacity;
+}
