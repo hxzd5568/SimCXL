@@ -286,10 +286,11 @@ P8：分析模型 + 周期仿真协同（借 LLMServingSim）（已完成）
 4. 指标：checkpoint 保存时间、恢复时间（time-to-resume）、保存带宽、热备命中率、每 chunk P95 延迟。
    - 结果（见 exec_summary.md P8）：分析模型 `analytical_model.py` + 共享 trace 生成器 `trace_gen.{h,c}` + 宿主机回放 `trace_model.c` + 周期仿真 `ckptbench_p8.c`。save 实测 76.99 ms vs 模型 76.26 ms（<1%）；resume 冷/热 26.0/14.0 ms vs 模型 27.1/15.8 ms；hit-rate 精确吻合。设备新增 `chunkLatency` 直方图：硬件每 chunk DMA ~10.7 µs（P95≈10.75 µs），guest 可见 ~100 µs 差额为软件开销——指向 P9/P10 的批量提交/多队列优化。
 
-P9：拓扑与一致性增强（借 CXLMemSim）
+P9：拓扑与一致性增强（借 CXLMemSim）（已完成）
 1. 显式拓扑对象：{GPU, DRAM pool, CXL pool, storage channels}，推导条带化与候选路径。
 2. Manifest 版本/代际/状态机完整化（FREE→PINNED→IN_FLIGHT→DISK_COMMITTED→HOT/EVICTABLE）。
 3. 多存储通道扩展（N 通道）、多 GPU DMA 队列。
+   - 结果（见 exec_summary.md P9）：`topology.{h,c}` 显式拓扑（条带化与 `ParallelStorage::mapAddr` 逐字节一致、候选路径、Bsave/Brestore 上界、路径代价）；`ckptd.{h,c}` 完整状态机 + manifest `version`；宿主机 `topology_scale.c` 全量 PASS；周期仿真 `ckptbench_p9.c`（4 通道 1024 chunk）条带均分 OK、状态直方图 committed=512/hot=511/evictable=1、GPU recheck OK。gem5 设备 `chanBytesWritten=1048576×4` 与 guest 拓扑推导一致。注：多 GPU DMA 队列属 P10（P9 只交付显式拓扑与 N 通道条带，设备单 engine 未动）。
 
 P10：多队列/多主机 + 完整验收
 1. 多 GPU DMA 队列；模型稳定后把 GPU DMA 与 storage DMA 拆成独立 PCI function。

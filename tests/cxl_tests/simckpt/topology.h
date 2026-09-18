@@ -26,6 +26,7 @@
 /* Memory nodes (matching the DRAM/CXL NUMA nodes of the board). */
 #define TOPO_DRAM 0
 #define TOPO_CXL  1
+#define TOPO_BOTH 2
 #define TOPO_NODES 2
 
 struct topo_storage_channel {

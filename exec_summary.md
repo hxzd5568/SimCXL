@@ -161,6 +161,24 @@ GPU payload ──> DRAM / CXL（pinned pool）
 - 关键结论：**串行路径瓶颈在 guest 软件而非硬件**。gem5 `chunkLatency` 直方图显示设备硬件每 chunk DMA 仅 **~10.7 µs**（P95 ≈ 10.75 µs，1920 样本落在同一 131 ns 桶内、极紧凑）；而 guest 可见每 chunk ~100 µs，差额 ~90 µs 全是软件开销（CRC32 + 每次提交都复位设备 + 门铃后忙轮询）。这给出 P9/P10 的优化方向：批量提交 / 多 DMA 队列 / 异步门铃 + 中断把软件开销从关键路径剥离。
 - 覆盖验收 #2（staging 带宽上界由分析模型给出）与 #8（每 chunk 硬件延迟经 `chunkLatency` 直方图独立统计）。
 
+### P9：拓扑与一致性增强（已完成）
+- `topology.{h,c}` —— 显式拓扑对象（借 CXLMemSim 拓扑思想）：`{GPU, DRAM pool, CXL pool, N storage channels}`，从它推导**条带化**（`channel = chunk_id % N`、`channel_offset = (chunk_id/N)*chunk`，与 gem5 `ParallelStorage::mapAddr` 完全一致）、**候选路径**（每个 chunk 的 {DRAM→channel, CXL→channel}，速率 = min(节点带宽, 通道带宽)）、**Bsave/Brestore 上界**，以及**通道/占位感知的路径代价**（`topology_path_cost`，供分流器选最不拥挤的路径）。
+- `ckptd.{h,c}` —— manifest **状态机完整化**：chunk 生命周期 `FREE→PINNED→IN_FLIGHT→DISK_COMMITTED→HOT→EVICTABLE→FREE`，新增 `ckpt_manifest_submit` / `ckpt_chunk_promote_hot` / `ckpt_chunk_evictable` / `ckpt_chunk_free` / `ckpt_chunk_state` / `ckpt_manifest_state_counts`；manifest 增加单调 `version`（每次 `finish` 自增），非法转移（如释放 PINNED/IN_FLIGHT chunk）被拒绝。
+- `topology_scale.c` —— 宿主机全量单测（512 MiB / 131072 chunk，毫秒级）：条带均分（4 通道各 128 MiB）、offset 算术、bounds 扫描（与 P8 一致）、候选路径速率/代价、完整状态机 + 非法转移 + version 自增——全部 PASS。
+- `bench/ckptbench_p9.c` + `configs/example/gem5_library/x86-cxl-ckptd-p9.py` —— 周期仿真（`--storage-channels N` 可配 N 通道）：构建拓扑、回放 save/restore 并让每个 chunk 走完整状态机。
+- 实测结果（4 通道、1024 chunk / 4 MiB）：
+  ```
+  SimCkptDevice opened (topology: 4 storage channels, 1024 chunks, hot_cap=512)
+  [topology] channel 0..3: 1 MiB each -> striping balance: OK
+  [manifest] version=1 gen=1 chunks=1024
+  [manifest] states: committed=512 hot=511 evictable=1
+  [perf] save 137.979 ms, restore 65.990 ms (1024 chunks, 4 channels)
+  gpu recheck: OK
+  PASS
+  ```
+- **交叉验证**：gem5 设备统计 `chanBytesWritten = 1048576 × 4`（每通道恰好 1 MiB）、`numWrites=1024`，与 guest 侧 `topology_stripe_channel` 推导的条带分布**逐字节一致**——证明拓扑对象与真实 `ParallelStorage::mapAddr` 语义对齐。
+- 覆盖验收 #3（多通道带宽/条带均分）与 #8（每通道字节独立统计，`chanBytesRead/chanBytesWritten`）。
+
 ## 关键实现细节与踩坑
 
 1. **E820 override 比较**：`X86E820Entry.addr/range_type` 是 gem5 的 `Addr`/`UInt64` 对象，不能直接 `== int`，需 `int(e.addr)/int(e.range_type)`。
@@ -213,6 +231,8 @@ chmod +x /tmp/img/home/test_code/ckptbench && sync && umount /tmp/img
 | P8 | `python3 tests/cxl_tests/simckpt/analytical_model.py`（宿主机，无需 gem5） | Bsave 上界扫描 + trace 时间预测 |
 | P8 | `make trace_model && ./trace_model`（宿主机，全量 512 MiB） | 参数化 trace + 分析模型毫秒级回放、LRU 命中率 |
 | P8 | `configs/example/gem5_library/x86-cxl-ckptd-p8.py` | 周期仿真抽样：save/resume/hit-rate/P95 实测 vs 模型预测对比 |
+| P9 | `make topology_scale && ./topology_scale`（宿主机，全量 512 MiB） | 条带均分 / bounds / 候选路径 / 完整状态机 |
+| P9 | `configs/example/gem5_library/x86-cxl-ckptd-p9.py --storage-channels N` | 显式拓扑 + 状态机 + N 通道条带平衡（guest 与设备统计交叉验证） |
 
 ```bash
 ./build/X86/gem5.opt -d m5out-p3 \

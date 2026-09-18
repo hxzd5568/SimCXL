@@ -60,12 +60,16 @@ void ckpt_manifest_init(struct ckpt_manifest *m);
 uint64_t ckpt_manifest_begin(struct ckpt_manifest *m, uint64_t ckpt_id,
                              uint32_t expected_chunks);
 
-/* Record a chunk as WRITING (payload saved, not yet durable/verified). */
+/* Record a chunk as PINNED (buffer pinned, not yet submitted). */
 int ckpt_manifest_add(struct ckpt_manifest *m, uint32_t chunk_id,
                       uint64_t logical_offset, uint32_t length,
                       uint32_t crc, uint8_t source);
 
-/* Mark a chunk COMMITTED (durable + CRC verified). */
+/* Submit a pinned chunk (PINNED -> IN_FLIGHT). */
+int ckpt_manifest_submit(struct ckpt_manifest *m, uint32_t chunk_id);
+
+/* Mark a chunk COMMITTED (durable + CRC verified). Accepts PINNED or
+ * IN_FLIGHT. */
 int ckpt_manifest_commit(struct ckpt_manifest *m, uint32_t chunk_id);
 
 /* True if every chunk of the current generation is COMMITTED. */

@@ -62,8 +62,21 @@ ckpt_manifest_add(struct ckpt_manifest *m, uint32_t chunk_id,
     c->length = length;
     c->crc32 = crc;
     c->source = source;
-    c->state = CKPT_STATE_IN_FLIGHT;
+    c->state = CKPT_STATE_PINNED;
     return 0;
+}
+
+int
+ckpt_manifest_submit(struct ckpt_manifest *m, uint32_t chunk_id)
+{
+    for (uint32_t i = 0; i < m->num_chunks; i++) {
+        if (m->chunks[i].chunk_id == chunk_id) {
+            if (m->chunks[i].state == CKPT_STATE_PINNED)
+                m->chunks[i].state = CKPT_STATE_IN_FLIGHT;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int
@@ -71,7 +84,9 @@ ckpt_manifest_commit(struct ckpt_manifest *m, uint32_t chunk_id)
 {
     for (uint32_t i = 0; i < m->num_chunks; i++) {
         if (m->chunks[i].chunk_id == chunk_id) {
-            m->chunks[i].state = CKPT_STATE_DISK_COMMITTED;
+            if (m->chunks[i].state == CKPT_STATE_PINNED ||
+                m->chunks[i].state == CKPT_STATE_IN_FLIGHT)
+                m->chunks[i].state = CKPT_STATE_DISK_COMMITTED;
             return 0;
         }
     }
