@@ -166,7 +166,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         if self.get_cache_hierarchy().is_ruby():
             dma_ports = [self.pc.south_bridge.ide.dma, cxl_mem_ctrl.dma]
             if hasattr(self.pc.south_bridge, "simckpt_device"):
-                dma_ports.append(self.pc.south_bridge.simckpt_device.dma)
+                for i in range(
+                    self.pc.south_bridge.simckpt_device.num_queues
+                ):
+                    dma_ports.append(self.pc.south_bridge.simckpt_device.dma[i])
             self.pc.attachIO(self.get_io_bus(), dma_ports)
         else:
             # # Constants similar to x86_traits.hh
@@ -332,7 +335,8 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         ports = [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports, 
                 self.pc.south_bridge.cxl_device.dma]
         if hasattr(self.pc.south_bridge, "simckpt_device"):
-            ports.append(self.pc.south_bridge.simckpt_device.dma)
+            for i in range(self.pc.south_bridge.simckpt_device.num_queues):
+                ports.append(self.pc.south_bridge.simckpt_device.dma[i])
         return ports
 
     @overrides(AbstractSystemBoard)

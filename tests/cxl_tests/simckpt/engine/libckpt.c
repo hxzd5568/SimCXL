@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,13 +18,22 @@
 
 #define BAR_SIZE (64 * 1024)
 
+struct simckpt_qstate {
+    struct simckpt_desc *sq;   /* persistent submission queue             */
+    struct simckpt_cpl *cq;    /* persistent completion queue             */
+    uint64_t sq_phys;
+    uint64_t cq_phys;
+    uint32_t tail;             /* absolute SQ tail (next write index)     */
+    uint32_t head;             /* absolute CQ head (next read index)      */
+    int programmed;            /* SQ/CQ base/depth programmed?            */
+};
+
 struct simckpt_ctx {
-    volatile uint8_t *bar;      /* BAR0 mapping                            */
-    int devfd;                  /* /dev/simckpt0 or /dev/mem               */
-    int use_driver;             /* 1 = simckpt.ko, 0 = /dev/mem fallback   */
-    struct simckpt_desc *sq;    /* persistent submission queue             */
-    struct simckpt_cpl *cq;     /* persistent completion queue            */
-    uint32_t batch_n;           /* descriptors in the last batch           */
+    volatile uint8_t *bar;     /* BAR0 mapping                             */
+    int devfd;                 /* /dev/simckpt0 or /dev/mem                */
+    int use_driver;            /* 1 = simckpt.ko, 0 = /dev/mem fallback    */
+    int n_queues;              /* number of device queues                  */
+    struct simckpt_qstate q[SIMCKPT_MAX_QUEUES];
 };
 
 static void
@@ -73,6 +83,46 @@ find_bar0_sysfs(void)
     return start;
 }
 
+static int
+alloc_rings(struct simckpt_ctx *ctx, int q)
+{
+    struct simckpt_qstate *qs = &ctx->q[q];
+    if (qs->sq)
+        return 0;
+
+    qs->sq = mmap(NULL, SIMCKPT_RING_DEPTH * SIMCKPT_DESC_SIZE,
+                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    qs->cq = mmap(NULL, SIMCKPT_RING_DEPTH * SIMCKPT_CPL_SIZE,
+                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (qs->sq == MAP_FAILED || qs->cq == MAP_FAILED)
+        return -1;
+    memset(qs->sq, 0, SIMCKPT_RING_DEPTH * SIMCKPT_DESC_SIZE);
+    memset(qs->cq, 0, SIMCKPT_RING_DEPTH * SIMCKPT_CPL_SIZE);
+    qs->sq_phys = simckpt_phys(ctx, qs->sq);
+    qs->cq_phys = simckpt_phys(ctx, qs->cq);
+    if (qs->sq_phys == (uint64_t)-1 || qs->cq_phys == (uint64_t)-1)
+        return -1;
+    return 0;
+}
+
+static void
+free_rings(struct simckpt_ctx *ctx, int q)
+{
+    struct simckpt_qstate *qs = &ctx->q[q];
+    if (qs->sq && qs->sq != MAP_FAILED)
+        munmap(qs->sq, SIMCKPT_RING_DEPTH * SIMCKPT_DESC_SIZE);
+    if (qs->cq && qs->cq != MAP_FAILED)
+        munmap(qs->cq, SIMCKPT_RING_DEPTH * SIMCKPT_CPL_SIZE);
+    qs->sq = NULL;
+    qs->cq = NULL;
+}
+
+static void
+select_queue(struct simckpt_ctx *ctx, int q)
+{
+    bar_wq(ctx, SIMCKPT_REG_QUEUE_SEL, (uint64_t)q);
+}
+
 struct simckpt_ctx *
 simckpt_open(const char *bar0_override)
 {
@@ -118,22 +168,20 @@ simckpt_open(const char *bar0_override)
         return NULL;
     }
 
-    /* Persistent rings (faulted in so they are physically present). */
-    ctx->sq = mmap(NULL, SIMCKPT_RING_DEPTH * SIMCKPT_DESC_SIZE,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ctx->cq = mmap(NULL, SIMCKPT_RING_DEPTH * SIMCKPT_CPL_SIZE,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ctx->sq == MAP_FAILED || ctx->cq == MAP_FAILED) {
+    ctx->devfd = fd;
+    ctx->use_driver = use_driver;
+
+    /* Allocate queue 0's rings eagerly (legacy single-queue API). */
+    if (alloc_rings(ctx, 0) != 0) {
         simckpt_close(ctx);
         return NULL;
     }
-    memset(ctx->sq, 0, SIMCKPT_RING_DEPTH * SIMCKPT_DESC_SIZE);
-    memset(ctx->cq, 0, SIMCKPT_RING_DEPTH * SIMCKPT_CPL_SIZE);
 
-    ctx->devfd = fd;
-    ctx->use_driver = use_driver;
+    ctx->n_queues = (int)bar_rq(ctx, SIMCKPT_REG_NUM_QUEUES);
+    if (ctx->n_queues < 1)
+        ctx->n_queues = 1;
+    if (ctx->n_queues > SIMCKPT_MAX_QUEUES)
+        ctx->n_queues = SIMCKPT_MAX_QUEUES;
     return ctx;
 }
 
@@ -142,10 +190,8 @@ simckpt_close(struct simckpt_ctx *ctx)
 {
     if (!ctx)
         return;
-    if (ctx->sq && ctx->sq != MAP_FAILED)
-        munmap(ctx->sq, SIMCKPT_RING_DEPTH * SIMCKPT_DESC_SIZE);
-    if (ctx->cq && ctx->cq != MAP_FAILED)
-        munmap(ctx->cq, SIMCKPT_RING_DEPTH * SIMCKPT_CPL_SIZE);
+    for (int q = 0; q < SIMCKPT_MAX_QUEUES; q++)
+        free_rings(ctx, q);
     if (ctx->bar && ctx->bar != MAP_FAILED)
         munmap((void *)ctx->bar, BAR_SIZE);
     if (ctx->devfd >= 0)
@@ -166,6 +212,14 @@ simckpt_phys(struct simckpt_ctx *ctx, void *buf)
 }
 
 int
+simckpt_num_queues(struct simckpt_ctx *ctx)
+{
+    return ctx->n_queues;
+}
+
+/* ---- legacy single-queue API (queue 0, per-batch reset semantics) ---- */
+
+int
 simckpt_submit(struct simckpt_ctx *ctx,
                const struct simckpt_desc *desc, uint32_t n,
                int enable_intr)
@@ -175,16 +229,17 @@ simckpt_submit(struct simckpt_ctx *ctx,
     if (!ctx || !desc || n == 0 || n > SIMCKPT_RING_DEPTH)
         return -EINVAL;
 
-    sq_phys = simckpt_phys(ctx, ctx->sq);
-    cq_phys = simckpt_phys(ctx, ctx->cq);
+    struct simckpt_qstate *qs = &ctx->q[0];
+    sq_phys = qs->sq_phys;
+    cq_phys = qs->cq_phys;
     if (sq_phys == (uint64_t)-1 || cq_phys == (uint64_t)-1)
         return -EIO;
 
-    memcpy(ctx->sq, desc, (size_t)n * SIMCKPT_DESC_SIZE);
-    ctx->batch_n = n;
+    memcpy(qs->sq, desc, (size_t)n * SIMCKPT_DESC_SIZE);
 
     /* Reset the device (rings + counters), then program and ring. After the
      * reset, COMPLETED starts at 0 and the CQ is written from entry 0. */
+    select_queue(ctx, 0);
     bar_wq(ctx, SIMCKPT_REG_CTRL, 0x2);
     bar_wq(ctx, SIMCKPT_REG_SQ_BASE, sq_phys);
     bar_wq(ctx, SIMCKPT_REG_SQ_DEPTH, SIMCKPT_RING_DEPTH);
@@ -192,6 +247,7 @@ simckpt_submit(struct simckpt_ctx *ctx,
     bar_wq(ctx, SIMCKPT_REG_CQ_DEPTH, SIMCKPT_RING_DEPTH);
     bar_wq(ctx, SIMCKPT_REG_INTR_EN, enable_intr ? 1 : 0);
     bar_wq(ctx, SIMCKPT_REG_SQ_DOORBELL, n);
+    qs->tail = n;
 
     return 0;
 }
@@ -199,6 +255,7 @@ simckpt_submit(struct simckpt_ctx *ctx,
 int
 simckpt_wait(struct simckpt_ctx *ctx, uint64_t n)
 {
+    select_queue(ctx, 0);
     for (int spins = 0; spins < 100000000; spins++) {
         if (bar_rq(ctx, SIMCKPT_REG_COMPLETED) >= n)
             return 0;
@@ -210,19 +267,114 @@ int
 simckpt_completions(struct simckpt_ctx *ctx,
                     struct simckpt_cpl *out, uint32_t n)
 {
+    struct simckpt_qstate *qs = &ctx->q[0];
     for (uint32_t i = 0; i < n; i++)
-        out[i] = ctx->cq[i % SIMCKPT_RING_DEPTH];
+        out[i] = qs->cq[i % SIMCKPT_RING_DEPTH];
     return 0;
 }
 
 int
 simckpt_get_counters(struct simckpt_ctx *ctx, struct simckpt_counters *c)
 {
+    select_queue(ctx, 0);
     c->completed   = bar_rq(ctx, SIMCKPT_REG_COMPLETED);
     c->intr_posted = bar_rq(ctx, SIMCKPT_REG_INTR_POSTED);
     c->errors      = bar_rq(ctx, SIMCKPT_REG_ERRORS);
     c->sq_head     = bar_rq(ctx, SIMCKPT_REG_SQ_HEAD);
     c->cq_tail     = bar_rq(ctx, SIMCKPT_REG_CQ_TAIL);
+    return 0;
+}
+
+/* ---- multi-queue batch API (P10) ------------------------------------ */
+
+int
+simckpt_queue_init(struct simckpt_ctx *ctx, int q, int enable_intr)
+{
+    if (!ctx || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    if (alloc_rings(ctx, q) != 0)
+        return -EIO;
+
+    struct simckpt_qstate *qs = &ctx->q[q];
+    select_queue(ctx, q);
+    bar_wq(ctx, SIMCKPT_REG_SQ_BASE, qs->sq_phys);
+    bar_wq(ctx, SIMCKPT_REG_SQ_DEPTH, SIMCKPT_RING_DEPTH);
+    bar_wq(ctx, SIMCKPT_REG_CQ_BASE, qs->cq_phys);
+    bar_wq(ctx, SIMCKPT_REG_CQ_DEPTH, SIMCKPT_RING_DEPTH);
+    bar_wq(ctx, SIMCKPT_REG_INTR_EN, enable_intr ? 1 : 0);
+    qs->programmed = 1;
+    qs->tail = 0;
+    qs->head = 0;
+    return 0;
+}
+
+int
+simckpt_submit_batch(struct simckpt_ctx *ctx, int q,
+                     const struct simckpt_desc *desc, uint32_t n)
+{
+    if (!ctx || !desc || n == 0 || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    if (n > SIMCKPT_RING_DEPTH)
+        return -EINVAL;
+
+    struct simckpt_qstate *qs = &ctx->q[q];
+    if (!qs->programmed)
+        return -EIO;
+
+    /* Copy descriptors into the ring, handling wraparound. */
+    uint32_t start = qs->tail;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t slot = (start + i) % SIMCKPT_RING_DEPTH;
+        memcpy(&qs->sq[slot], &desc[i], SIMCKPT_DESC_SIZE);
+    }
+    qs->tail = start + n;
+
+    select_queue(ctx, q);
+    bar_wq(ctx, SIMCKPT_REG_SQ_DOORBELL, qs->tail);
+    return 0;
+}
+
+int
+simckpt_wait_q(struct simckpt_ctx *ctx, int q, uint64_t target)
+{
+    if (!ctx || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    select_queue(ctx, q);
+    for (int spins = 0; spins < 100000000; spins++) {
+        if (bar_rq(ctx, SIMCKPT_REG_COMPLETED) >= target)
+            return 0;
+        sched_yield();
+    }
+    return -ETIMEDOUT;
+}
+
+int
+simckpt_completions_q(struct simckpt_ctx *ctx, int q,
+                      uint64_t start, struct simckpt_cpl *out, uint32_t n)
+{
+    if (!ctx || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    struct simckpt_qstate *qs = &ctx->q[q];
+    for (uint32_t i = 0; i < n; i++)
+        out[i] = qs->cq[(start + i) % SIMCKPT_RING_DEPTH];
+    return 0;
+}
+
+int
+simckpt_get_qcounters(struct simckpt_ctx *ctx, int q,
+                      struct simckpt_qcounters *c)
+{
+    if (!ctx || !c || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    select_queue(ctx, q);
+    c->outstanding     = bar_rq(ctx, SIMCKPT_REG_Q_OUTSTANDING);
+    c->retry           = bar_rq(ctx, SIMCKPT_REG_Q_RETRY);
+    c->queue_full      = bar_rq(ctx, SIMCKPT_REG_Q_QUEUE_FULL);
+    c->completed_bytes = bar_rq(ctx, SIMCKPT_REG_Q_COMPLETED_BYTES);
+    c->latency_avg     = bar_rq(ctx, SIMCKPT_REG_Q_LATENCY_AVG);
+    c->latency_p95     = bar_rq(ctx, SIMCKPT_REG_Q_LATENCY_P95);
+    c->issue_tick      = bar_rq(ctx, SIMCKPT_REG_Q_ISSUE_TICK);
+    c->done_tick       = bar_rq(ctx, SIMCKPT_REG_Q_DONE_TICK);
     return 0;
 }
 

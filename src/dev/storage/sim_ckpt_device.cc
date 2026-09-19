@@ -1,5 +1,6 @@
 #include "dev/storage/sim_ckpt_device.hh"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <string>
@@ -56,9 +57,49 @@ crcTable()
     return table;
 }
 
+// Reproducible GPU payload generator (mirrors the guest-side gpu_dma_engine.c
+// so a staged chunk can later be byte-compared against the reference PRNG).
+uint32_t
+mix32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+uint32_t
+payloadWord(uint32_t checkpoint_id, uint32_t chunk_id, uint32_t word_index)
+{
+    uint32_t h = mix32(checkpoint_id * 2654435761u);
+    h = mix32(h ^ (chunk_id * 40503u));
+    h = mix32(h ^ word_index);
+    return h;
+}
+
+void
+generatePayloadBytes(uint8_t *p, size_t len, uint32_t checkpoint_id,
+                     uint32_t chunk_id)
+{
+    size_t i = 0;
+    for (; i + 4 <= len; i += 4) {
+        uint32_t w = payloadWord(checkpoint_id, chunk_id,
+                                 static_cast<uint32_t>(i / 4));
+        p[i]     = static_cast<uint8_t>(w);
+        p[i + 1] = static_cast<uint8_t>(w >> 8);
+        p[i + 2] = static_cast<uint8_t>(w >> 16);
+        p[i + 3] = static_cast<uint8_t>(w >> 24);
+    }
+    for (; i < len; i++)
+        p[i] = static_cast<uint8_t>(
+            payloadWord(checkpoint_id, chunk_id, static_cast<uint32_t>(i)));
+}
+
 } // anonymous namespace
 
-SimCkptDevice::CkptStats::CkptStats(SimCkptDevice &dev)
+SimCkptDevice::CkptStats::CkptStats(SimCkptDevice &dev, uint32_t numQueues)
     : statistics::Group(&dev),
       ADD_STAT(numDescCompleted, statistics::units::Count::get(),
                "Number of completed descriptors"),
@@ -79,15 +120,31 @@ SimCkptDevice::CkptStats::CkptStats(SimCkptDevice &dev)
       ADD_STAT(execTicks, statistics::units::Tick::get(),
                "Execution ticks (last completion - first issue)"),
       ADD_STAT(chunkLatency, statistics::units::Tick::get(),
-               "Per-chunk completion latency (issue -> completion)")
+               "Per-chunk completion latency (issue -> completion)"),
+      ADD_STAT(qDescCompleted, statistics::units::Count::get(),
+               "Descriptors completed per queue"),
+      ADD_STAT(qBytesRead, statistics::units::Byte::get(),
+               "Bytes DMA-read per queue"),
+      ADD_STAT(qBytesWritten, statistics::units::Byte::get(),
+               "Bytes DMA-written per queue"),
+      ADD_STAT(qQueueFull, statistics::units::Count::get(),
+               "Queue-full events per queue"),
+      ADD_STAT(qRetry, statistics::units::Count::get(),
+               "Storage/DMA retries per queue")
 {
     execTicks = lastCompletionTick - firstIssueTick;
     chunkLatency.init(100);
+    qDescCompleted.init(numQueues);
+    qBytesRead.init(numQueues);
+    qBytesWritten.init(numQueues);
+    qQueueFull.init(numQueues);
+    qRetry.init(numQueues);
 }
 
-SimCkptDevice::Slot::Slot(SimCkptDevice *dev, int idx)
-    : dmaDoneEvent([dev, idx] { dev->onDmaDone(idx); },
-                   dev->name() + ".slot" + std::to_string(idx) + ".dmaDone")
+SimCkptDevice::Slot::Slot(SimCkptDevice *dev, int queue, int idx)
+    : dmaDoneEvent([dev, queue, idx] { dev->onDmaDone(queue, idx); },
+                   dev->name() + ".q" + std::to_string(queue) +
+                   ".slot" + std::to_string(idx) + ".dmaDone")
 {
     std::memset(descBuf, 0, sizeof(descBuf));
     std::memset(cplBuf, 0, sizeof(cplBuf));
@@ -96,16 +153,35 @@ SimCkptDevice::Slot::Slot(SimCkptDevice *dev, int idx)
 SimCkptDevice::SimCkptDevice(const Params &p)
     : PciDevice(p),
       queueDepth(p.queue_depth),
+      numQueues(p.num_queues),
       maxChunkSize(p.max_chunk_size),
       procLat(p.proc_lat),
       storagePort(name() + ".storage_port", this),
-      stats(*this)
+      stats(*this, numQueues)
 {
-    for (uint32_t i = 0; i < queueDepth; i++) {
-        slots.emplace_back(std::make_unique<Slot>(this, i));
-        slots.back()->dataBuf.resize(static_cast<size_t>(maxChunkSize));
+    for (uint32_t q = 0; q < numQueues; q++) {
+        auto qq = std::make_unique<Queue>();
+        for (uint32_t i = 0; i < queueDepth; i++) {
+            qq->slots.emplace_back(std::make_unique<Slot>(this, q, i));
+            qq->slots.back()->dataBuf.resize(static_cast<size_t>(maxChunkSize));
+        }
+        queues.emplace_back(std::move(qq));
+        dmaPorts.emplace_back(std::make_unique<DmaPort>(this, sys,
+                                                        p.sid, p.ssid));
     }
-    resetState();
+    queueSel = 0;
+}
+
+void
+SimCkptDevice::init()
+{
+    for (uint32_t q = 0; q < numQueues; q++)
+        panic_if(!dmaPorts[q]->isConnected(),
+                 "DMA lane port %u of %s not connected to anything!",
+                 q, name());
+    // The inherited single dmaPort (DmaDevice) is unused; skip its
+    // connectivity check and run the PIO check directly.
+    PioDevice::init();
 }
 
 SimCkptDevice::StoragePort::StoragePort(const std::string &name,
@@ -135,6 +211,8 @@ SimCkptDevice::StoragePort::trySend()
     while (!pending.empty()) {
         if (!sendTimingReq(pending.front())) {
             blocked = true;
+            device->queues[device->queueSel]->retryCount++;
+            device->stats.qRetry[device->queueSel]++;
             return;
         }
         pending.pop_front();
@@ -165,27 +243,50 @@ SimCkptDevice::getPort(const std::string &if_name, PortID idx)
 {
     if (if_name == "storage_port")
         return storagePort;
+    if (if_name == "dma") {
+        panic_if(idx >= static_cast<PortID>(dmaPorts.size()),
+                 "SimCkptDevice: dma lane index %d out of range", idx);
+        return *dmaPorts[idx];
+    }
     return PciDevice::getPort(if_name, idx);
 }
 
-void
-SimCkptDevice::resetState()
+SimCkptDevice::Queue &
+SimCkptDevice::selectedQueue()
 {
-    ctrl = 0;
-    status = 0;
-    sqBase = 0;
-    sqDepth = 0;
-    cqBase = 0;
-    cqDepth = 0;
-    sqHead = 0;
-    sqTail = 0;
-    cqHead = 0;
-    cqTail = 0;
-    completedCount = 0;
-    intrEnable = false;
-    intrPosted = 0;
-    errorCount = 0;
-    for (auto &sp : slots) {
+    return *queues[queueSel];
+}
+
+const SimCkptDevice::Queue &
+SimCkptDevice::selectedQueue() const
+{
+    return *queues[queueSel];
+}
+
+void
+SimCkptDevice::resetQueue(Queue &q)
+{
+    q.sqBase = 0;
+    q.sqDepth = 0;
+    q.cqBase = 0;
+    q.cqDepth = 0;
+    q.sqHead = 0;
+    q.sqTail = 0;
+    q.cqHead = 0;
+    q.cqTail = 0;
+    q.completedCount = 0;
+    q.intrEnable = false;
+    q.intrPosted = 0;
+    q.execBusy = false;
+    q.numQueueFull = 0;
+    q.retryCount = 0;
+    q.completedBytes = 0;
+    q.latencySum = 0;
+    q.latencyCount = 0;
+    q.latencySamples.clear();
+    q.firstIssueTick = 0;
+    q.lastCompletionTick = 0;
+    for (auto &sp : q.slots) {
         sp->state = State::Free;
         sp->crc = 0;
     }
@@ -215,6 +316,19 @@ SimCkptDevice::crc32(const uint8_t *data, size_t len) const
     return crc ^ 0xFFFFFFFFU;
 }
 
+uint64_t
+SimCkptDevice::queueLatencyP95(const Queue &q) const
+{
+    if (q.latencySamples.empty())
+        return 0;
+    auto samples = q.latencySamples;
+    std::sort(samples.begin(), samples.end());
+    size_t idx = static_cast<size_t>(0.95 * static_cast<double>(samples.size()));
+    if (idx >= samples.size())
+        idx = samples.size() - 1;
+    return samples[idx];
+}
+
 void
 SimCkptDevice::parseDescriptor(Slot &slot)
 {
@@ -240,7 +354,15 @@ SimCkptDevice::parseDescriptor(Slot &slot)
 }
 
 void
-SimCkptDevice::postCompletion(Slot &slot)
+SimCkptDevice::generatePayload(Slot &slot)
+{
+    generatePayloadBytes(slot.dataBuf.data(), slot.desc.length,
+                         slot.desc.checkpoint_id, slot.desc.chunk_id);
+    slot.crc = crc32(slot.dataBuf.data(), slot.desc.length);
+}
+
+void
+SimCkptDevice::postCompletion(int qIdx, Queue &q, Slot &slot)
 {
     uint8_t *b = slot.cplBuf;
     writeU32(b + 0, slot.desc.checkpoint_id);
@@ -253,51 +375,56 @@ SimCkptDevice::postCompletion(Slot &slot)
     writeU32(b + 8, cplStatus);
     writeU32(b + 12, slot.crc);
 
-    Addr cplAddr = cqBase + static_cast<uint64_t>(cqTail % cqDepth) * CPL_SIZE;
+    Addr cplAddr = q.cqBase + static_cast<uint64_t>(q.cqTail % q.cqDepth) *
+                                CPL_SIZE;
     slot.state = State::WritingCpl;
-    dmaPort.dmaAction(MemCmd::WriteReq, cplAddr, CPL_SIZE,
-                      &slot.dmaDoneEvent, slot.cplBuf, 0);
-    cqTail++;
+    dmaPorts[qIdx]->dmaAction(MemCmd::WriteReq, cplAddr, CPL_SIZE,
+                              &slot.dmaDoneEvent, slot.cplBuf, 0);
+    q.cqTail++;
 }
 
 void
-SimCkptDevice::tryFillSlots()
+SimCkptDevice::tryFillSlots(int qIdx, Queue &q)
 {
-    if (sqDepth == 0)
+    if (q.sqDepth == 0)
         return;
 
-    if (!execBusy && sqHead != sqTail) {
-        execBusy = true;
+    if (!q.execBusy && q.sqHead != q.sqTail) {
+        q.execBusy = true;
+        q.firstIssueTick = curTick();
         stats.firstIssueTick = curTick();
     }
 
-    while (sqHead != sqTail) {
+    while (q.sqHead != q.sqTail) {
         Slot *free = nullptr;
-        for (auto &sp : slots) {
+        for (auto &sp : q.slots) {
             if (sp->state == State::Free) {
                 free = sp.get();
                 break;
             }
         }
         if (!free) {
+            q.numQueueFull++;
             stats.numQueueFull++;
+            stats.qQueueFull[qIdx]++;
             break;
         }
 
         free->state = State::FetchDesc;
         free->issueTick = curTick();
-        Addr descAddr = sqBase +
-            static_cast<uint64_t>(sqHead % sqDepth) * DESC_SIZE;
-        dmaPort.dmaAction(MemCmd::ReadReq, descAddr, DESC_SIZE,
-                          &free->dmaDoneEvent, free->descBuf, procLat);
-        sqHead++;
+        Addr descAddr = q.sqBase +
+            static_cast<uint64_t>(q.sqHead % q.sqDepth) * DESC_SIZE;
+        dmaPorts[qIdx]->dmaAction(MemCmd::ReadReq, descAddr, DESC_SIZE,
+                                  &free->dmaDoneEvent, free->descBuf, procLat);
+        q.sqHead++;
     }
 }
 
 void
-SimCkptDevice::onDmaDone(int idx)
+SimCkptDevice::onDmaDone(int queue, int idx)
 {
-    Slot &slot = *slots[idx];
+    Queue &q = *queues[queue];
+    Slot &slot = *q.slots[idx];
 
     switch (slot.state) {
       case State::FetchDesc: {
@@ -308,14 +435,28 @@ SimCkptDevice::onDmaDone(int idx)
             errorCount++;
             stats.numErrors++;
             slot.state = State::Free;
-            tryFillSlots();
+            tryFillSlots(queue, q);
+            break;
+        }
+        if (slot.desc.flags & FLAG_STAGE) {
+            // GPU staging: synthesize the reproducible payload directly in the
+            // device and DMA-write it to the DRAM/CXL destination (no source
+            // read, no storage access).
+            generatePayload(slot);
+            DPRINTF(SimCkptDevice, "stage ckpt=%u chunk=%u -> dst=%#lx\n",
+                    slot.desc.checkpoint_id, slot.desc.chunk_id,
+                    slot.desc.dst_addr);
+            slot.state = State::Writing;
+            dmaPorts[queue]->dmaAction(MemCmd::WriteReq, slot.desc.dst_addr,
+                                       slot.desc.length, &slot.dmaDoneEvent,
+                                       slot.dataBuf.data(), 0);
             break;
         }
         slot.state = State::Reading;
         if (slot.save) {
-            dmaPort.dmaAction(MemCmd::ReadReq, slot.desc.src_addr,
-                              slot.desc.length, &slot.dmaDoneEvent,
-                              slot.dataBuf.data(), 0);
+            dmaPorts[queue]->dmaAction(MemCmd::ReadReq, slot.desc.src_addr,
+                                       slot.desc.length, &slot.dmaDoneEvent,
+                                       slot.dataBuf.data(), 0);
         } else {
             storagePort.sendStorage(MemCmd::ReadReq, slot.desc.storage_offset,
                                     slot.desc.length, slot.dataBuf.data(),
@@ -326,55 +467,65 @@ SimCkptDevice::onDmaDone(int idx)
       case State::Reading: {
         slot.crc = crc32(slot.dataBuf.data(), slot.desc.length);
         stats.numBytesRead += slot.desc.length;
+        stats.qBytesRead[queue] += slot.desc.length;
         slot.state = State::Writing;
         if (slot.save) {
             storagePort.sendStorage(MemCmd::WriteReq, slot.desc.storage_offset,
                                     slot.desc.length, slot.dataBuf.data(),
                                     &slot.dmaDoneEvent);
         } else {
-            dmaPort.dmaAction(MemCmd::WriteReq, slot.desc.dst_addr,
-                              slot.desc.length, &slot.dmaDoneEvent,
-                              slot.dataBuf.data(), 0);
+            dmaPorts[queue]->dmaAction(MemCmd::WriteReq, slot.desc.dst_addr,
+                                       slot.desc.length, &slot.dmaDoneEvent,
+                                       slot.dataBuf.data(), 0);
         }
         break;
       }
       case State::Writing: {
-        postCompletion(slot);
+        postCompletion(queue, q, slot);
         break;
       }
       case State::WritingCpl: {
         stats.numBytesWritten += slot.desc.length;
-        completedCount++;
+        stats.qBytesWritten[queue] += slot.desc.length;
+        q.completedBytes += slot.desc.length;
+        q.completedCount++;
         stats.numDescCompleted++;
-        stats.chunkLatency.sample(curTick() - slot.issueTick);
-        if (intrEnable) {
+        stats.qDescCompleted[queue]++;
+        Tick lat = curTick() - slot.issueTick;
+        stats.chunkLatency.sample(lat);
+        q.latencySum += lat;
+        q.latencyCount++;
+        if (q.latencySamples.size() < (1 << 20))
+            q.latencySamples.push_back(lat);
+        if (q.intrEnable) {
             intrPost();
-            intrPosted++;
+            q.intrPosted++;
             stats.numInterrupts++;
         }
         DPRINTF(SimCkptDevice,
-                "chunk %u (ckpt %u) done, crc=%#x\n",
-                slot.desc.chunk_id, slot.desc.checkpoint_id, slot.crc);
+                "queue %d chunk %u (ckpt %u) done, crc=%#x\n",
+                queue, slot.desc.chunk_id, slot.desc.checkpoint_id, slot.crc);
         slot.state = State::Free;
-        tryFillSlots();
+        tryFillSlots(queue, q);
 
-        if (execBusy) {
-            bool idle = (sqHead == sqTail);
-            for (auto &sp : slots) {
+        if (q.execBusy) {
+            bool idle = (q.sqHead == q.sqTail);
+            for (auto &sp : q.slots) {
                 if (sp->state != State::Free) {
                     idle = false;
                     break;
                 }
             }
             if (idle) {
-                execBusy = false;
+                q.execBusy = false;
+                q.lastCompletionTick = curTick();
                 stats.lastCompletionTick = curTick();
             }
         }
         break;
       }
       default:
-        panic("SimCkptDevice: slot %d in bad state", idx);
+        panic("SimCkptDevice: queue %d slot %d in bad state", queue, idx);
     }
 }
 
@@ -384,19 +535,38 @@ SimCkptDevice::read(PacketPtr pkt)
     Addr offset = barOffset(pkt->getAddr());
     uint64_t value = 0;
 
+    const Queue &q = selectedQueue();
+
     switch (offset) {
       case REG_CTRL:        value = ctrl; break;
       case REG_STATUS:      value = status; break;
-      case REG_SQ_BASE:     value = sqBase; break;
-      case REG_SQ_DEPTH:    value = sqDepth; break;
-      case REG_CQ_BASE:     value = cqBase; break;
-      case REG_CQ_DEPTH:    value = cqDepth; break;
-      case REG_COMPLETED:   value = completedCount; break;
-      case REG_INTR_EN:     value = intrEnable ? 1 : 0; break;
-      case REG_INTR_POSTED: value = intrPosted; break;
-      case REG_SQ_HEAD:     value = sqHead; break;
-      case REG_CQ_TAIL:     value = cqTail; break;
+      case REG_SQ_BASE:     value = q.sqBase; break;
+      case REG_SQ_DEPTH:    value = q.sqDepth; break;
+      case REG_CQ_BASE:     value = q.cqBase; break;
+      case REG_CQ_DEPTH:    value = q.cqDepth; break;
+      case REG_COMPLETED:   value = q.completedCount; break;
+      case REG_INTR_EN:     value = q.intrEnable ? 1 : 0; break;
+      case REG_INTR_POSTED: value = q.intrPosted; break;
+      case REG_SQ_HEAD:     value = q.sqHead; break;
+      case REG_CQ_TAIL:     value = q.cqTail; break;
       case REG_ERRORS:      value = errorCount; break;
+      case REG_NUM_QUEUES:  value = numQueues; break;
+      case REG_QUEUE_SEL:   value = queueSel; break;
+      case REG_Q_OUTSTANDING: {
+        for (auto &sp : q.slots)
+            if (sp->state != State::Free)
+                value++;
+        break;
+      }
+      case REG_Q_RETRY:     value = q.retryCount; break;
+      case REG_Q_QUEUE_FULL: value = q.numQueueFull; break;
+      case REG_Q_COMPLETED_BYTES: value = q.completedBytes; break;
+      case REG_Q_LATENCY_AVG:
+        value = q.latencyCount ? q.latencySum / q.latencyCount : 0;
+        break;
+      case REG_Q_LATENCY_P95: value = queueLatencyP95(q); break;
+      case REG_Q_ISSUE_TICK: value = q.firstIssueTick; break;
+      case REG_Q_DONE_TICK: value = q.lastCompletionTick; break;
       default:              value = 0; break;
     }
 
@@ -415,34 +585,39 @@ SimCkptDevice::write(PacketPtr pkt)
       case REG_CTRL:
         ctrl = value;
         if (value & CTRL_RESET) {
-            resetState();
+            resetQueue(selectedQueue());
         }
         if (value & CTRL_START) {
-            tryFillSlots();
+            tryFillSlots(queueSel, selectedQueue());
         }
         break;
+      case REG_QUEUE_SEL:
+        if (value < numQueues)
+            queueSel = value;
+        break;
       case REG_SQ_BASE:
-        sqBase = value;
+        selectedQueue().sqBase = value;
         break;
       case REG_SQ_DEPTH:
-        sqDepth = value;
+        selectedQueue().sqDepth = value;
         break;
       case REG_CQ_BASE:
-        cqBase = value;
+        selectedQueue().cqBase = value;
         break;
       case REG_CQ_DEPTH:
-        cqDepth = value;
+        selectedQueue().cqDepth = value;
         break;
       case REG_SQ_DOORBELL:
-        sqTail = value;
-        DPRINTF(SimCkptDevice, "doorbell sqTail=%u\n", sqTail);
-        tryFillSlots();
+        selectedQueue().sqTail = value;
+        DPRINTF(SimCkptDevice, "doorbell queue=%u sqTail=%u\n",
+                queueSel, selectedQueue().sqTail);
+        tryFillSlots(queueSel, selectedQueue());
         break;
       case REG_CQ_DOORBELL:
-        cqHead = value;
+        selectedQueue().cqHead = value;
         break;
       case REG_INTR_EN:
-        intrEnable = (value & 1) != 0;
+        selectedQueue().intrEnable = (value & 1) != 0;
         break;
       default:
         break;

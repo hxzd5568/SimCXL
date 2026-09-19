@@ -35,18 +35,27 @@ class SimCkptDevice(PciDevice):
     memory plus a doorbell interface in BAR0. The device reads a source buffer,
     computes a CRC32 over the payload, writes the payload to a destination
     buffer, and only then posts a completion (optionally raising an interrupt).
+
+    Since P10 the device exposes `num_queues` independent engines (one per GPU
+    DMA lane), each with its own DMA port (so each lane gets its own Ruby
+    DMASequencer) and its own SQ/CQ.
     """
 
     type = "SimCkptDevice"
     cxx_header = "dev/storage/sim_ckpt_device.hh"
     cxx_class = "gem5::SimCkptDevice"
 
+    dma = VectorRequestPort("Per-lane DMA port (one per queue)")
+
     storage_port = RequestPort(
         "Port to the ParallelStorage backend (save/restore)"
     )
 
     queue_depth = Param.Unsigned(
-        32, "Maximum number of descriptors processed concurrently"
+        32, "Maximum number of descriptors processed concurrently per queue"
+    )
+    num_queues = Param.Unsigned(
+        2, "Number of independent submission/completion engines (GPU DMA lanes)"
     )
     max_chunk_size = Param.MemorySize(
         "4KiB", "Maximum payload size of a single descriptor"

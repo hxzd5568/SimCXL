@@ -12,7 +12,8 @@ LIB_SRC = engine/libckpt.c ckptd.c
 ENG_SRC = engine/gpu_dma_engine.c engine/sha256.c
 
 all: ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 \
-	ckptbench_p8 ckptbench_p9 trace_model topology_scale
+	ckptbench_p8 ckptbench_p9 ckptbench_p10 trace_model topology_scale \
+	p10_scale
 
 ckptbench: bench/ckptbench.c $(LIB_SRC) engine/libckpt.h ckptd.h include/simckpt_uapi.h
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench.c $(LIB_SRC)
@@ -46,6 +47,12 @@ ckptbench_p9: bench/ckptbench_p9.c $(LIB_SRC) engine/gpu_dma_engine.c \
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_p9.c $(LIB_SRC) \
 		engine/gpu_dma_engine.c topology.c
 
+ckptbench_p10: bench/ckptbench_p10.c $(LIB_SRC) engine/gpu_dma_engine.c \
+		topology.c engine/libckpt.h ckptd.h include/simckpt_uapi.h \
+		engine/gpu_dma_engine.h topology.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_p10.c $(LIB_SRC) \
+		engine/gpu_dma_engine.c topology.c
+
 # Host-side unit test: prove the balancer routes a full-size (512 MiB)
 # checkpoint without running gem5 (pure C, milliseconds).
 balancer_scale: balancer_scale.c balancer.c balancer.h
@@ -60,6 +67,10 @@ trace_model: trace_model.c trace_gen.c trace_gen.h
 topology_scale: topology_scale.c topology.c topology.h ckptd.c ckptd.h
 	$(CC) -O2 -Wall -I. -o $@ topology_scale.c topology.c ckptd.c
 
+# Host-side multi-queue batch logic test at full scale, no gem5 (P10).
+p10_scale: p10_scale.c
+	$(CC) -O2 -Wall -I. -o $@ p10_scale.c
+
 # Kernel module. The guest kernel is a custom 6.12.0+ image whose headers are
 # not shipped in the disk image (only 4.15 headers are present), so this target
 # requires a matching KDIR, e.g.:
@@ -71,7 +82,8 @@ module:
 
 clean:
 	rm -f ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 \
-		ckptbench_p8 ckptbench_p9 balancer_scale trace_model topology_scale
+		ckptbench_p8 ckptbench_p9 ckptbench_p10 balancer_scale trace_model \
+		topology_scale p10_scale
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/driver clean 2>/dev/null || true
 
 .PHONY: all module clean

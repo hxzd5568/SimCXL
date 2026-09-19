@@ -179,6 +179,37 @@ GPU payload ──> DRAM / CXL（pinned pool）
 - **交叉验证**：gem5 设备统计 `chanBytesWritten = 1048576 × 4`（每通道恰好 1 MiB）、`numWrites=1024`，与 guest 侧 `topology_stripe_channel` 推导的条带分布**逐字节一致**——证明拓扑对象与真实 `ParallelStorage::mapAddr` 语义对齐。
 - 覆盖验收 #3（多通道带宽/条带均分）与 #8（每通道字节独立统计，`chanBytesRead/chanBytesWritten`）。
 
+### P10：多队列 / 多 lane 引擎 + 完整验收矩阵（已完成）
+
+- **设备多队列**（`SimCkptDevice`，`src/dev/storage/sim_ckpt_device.{hh,cc}` / `SimCkpt.py`）：
+  - 新增 `num_queues` 参数（默认 2），每个 queue 拥有独立的 SQ/CQ（head/tail）、独立的 32-entry descriptor slot pool、独立的 completion/中断计数与 per-link 统计；`REG_QUEUE_SEL`（0x70）选择当前 queue，所有寄存器操作作用于选中 queue；`REG_NUM_QUEUES`（0x78）报告队列数。
+  - **每 lane 独立 DMA 端口**：`dma` 改为 `VectorRequestPort`，每 queue 一个 `DmaPort`，x86_board 把每个 lane 端口分别接给独立的 Ruby `DMASequencer`（`dma_controllers3/4`），去掉单引擎串行化。
+  - 新增 `FLAG_STAGE` 描述符：设备按 `gpu_dma_engine.c` 同款 PRNG 生成 payload 并 DMA 写到 DRAM/CXL（建模 GPU→内存 staging，无需源读/存储访问）。
+  - **per-link（per-queue）只读 BAR 统计**（验收 #8）：`REG_Q_OUTSTANDING/RETRY/QUEUE_FULL/COMPLETED_BYTES/LATENCY_AVG/P95/ISSUE_TICK/DONE_TICK`（0x80–0xB8），guest 可读，对应 gem5 侧 `qDescCompleted/qBytesRead/qBytesWritten/qQueueFull/qRetry`（`statistics::Vector`）。
+- **guest 侧批量/多队列 API**（`tests/cxl_tests/simckpt/engine/libckpt.{h,c}`）：`simckpt_queue_init`（一次性编程 ring，不再每次提交都复位）、`simckpt_submit_batch`（绝对 tail + 一次门铃）、`simckpt_wait_q`（绝对完成计数 + `sched_yield` 而非忙轮询）、`simckpt_completions_q`（绝对 head 读取）、`simckpt_get_qcounters`（读 per-link 统计）。`SIMCKPT_RING_DEPTH` 提到 16384，保证大数据量单批提交不绕环覆盖。
+- **验收矩阵**（`bench/ckptbench_p10.c` + `configs/example/gem5_library/x86-cxl-ckptd-p10.py`，`--storage-channels/--num-queues/--queue-depth/--ckpt-mib`）：
+  ```
+  [acceptance] #2 dual-lane staging bandwidth
+    single DRAM : 30.71 GB/s, single CXL : 31.91 GB/s
+    balanced split: 502 DRAM + 522 CXL chunks
+    dual-lane   : 24.69 GB/s (vs fastest single 31.91 GB/s)
+  [acceptance] #1/#5/#8 persist + out-of-order restore   ... mismatches=0
+    [link q0] completed_bytes=10362880 ... lat_p95=11424549 bw=56.34 GB/s
+    [link q1] completed_bytes=10608640 ... lat_p95=11205624 bw=57.72 GB/s
+  [acceptance] #3 storage channel striping  (4 x 1 MiB, 均分 OK)
+  [acceptance] #4 CXL hot standby  cold=1024 reads, hot=512 reads
+  [acceptance] #6 pressure state machine  FROZEN denied new pin OK
+  [acceptance] #7 in-flight -> committed lifecycle  OK
+  [P10 acceptance matrix]
+    #1 CRC/byte consistency PASS  #2 ... FAIL (contention)  #3 PASS
+    #4 PASS  #5 PASS  #6 PASS  #7 PASS  #8 PASS
+  ```
+  7/8 通过；#8（每条链路排队/带宽/延迟/重试）现在有真正的 per-queue 统计。
+- **宿主机全量单测** `p10_scale.c`：512 MiB（131072 chunk）下验证带宽均衡 split + 绝对 ring 索引绕环（depth 16384 不覆盖在飞槽）+ 乱序完成按 chunk_id 匹配，毫秒级 PASS。
+- **P8 优化落地**：批量提交（一次门铃 N 个 descriptor）+ 中断就绪（`REG_INTR_EN`/`intrPost` 已使能，guest 改 `sched_yield` 等待）+ CRC 卸载（save 描述符 `crc32=0`，设备计算、guest 事后校验）——去掉每 chunk 复位/忙轮询/CRC 的 ~90µs 软件开销。
+
+**#2 的诚实结论（建模边界）**：每 lane 独立 engine 已实现（单 lane DRAM/CXL 各自 ~31 GB/s，机制存在、数据经两 lane 并行 staging 且逐字节正确）；但并发 DRAM+CXL staging 实测总带宽 ~25 GB/s，**低于**最快单路径（~31 GB/s）。根因是 DDR5 控制器写缓冲 `write_buffer_size=64`（4 KiB）在双 lane 并发写时被击穿，`numWrRetry` 达数万次（DRAM 69185 / CXL 49475），Ruby 写路径在写缓冲反压处串行化。这是现有内存模型的写队列深度限制，非多队列实现缺陷；要真正兑现「双内存路径 > 单路径」需增大内存控制器写缓冲或换成更细的 DRAM 模型（后续阶段）。
+
 ## 关键实现细节与踩坑
 
 1. **E820 override 比较**：`X86E820Entry.addr/range_type` 是 gem5 的 `Addr`/`UInt64` 对象，不能直接 `== int`，需 `int(e.addr)/int(e.range_type)`。
@@ -191,6 +222,8 @@ GPU payload ──> DRAM / CXL（pinned pool）
 8. **多代 checkpoint 存储布局**：每代放在 `gen * checkpoint_size` 的独立存储基址，避免覆盖；manifest 用 `expected_chunks` 判定完整性（缺块即视为未完成）。
 9. **内核模块无法在本环境编译**：guest 内核是定制 6.12.0+，disk image 只带 4.15 头文件；`simckpt.ko` 作为参考实现，测试走 libckpt 的 `/dev/mem` 回退路径（同一 ABI）。
 10. **Ruby directory 的 DMA 一致性 assert**：restore 写回 DRAM 时，若目标物理页与之前某次 save 读过的物理页复用（跨进程 crash/restart 后 malloc 复用同一物理页），Ruby directory 会命中 `MESI_Two_Level-dir.sm` 的 `assert(is_valid(tbe))`（`da_sendDMAAck`）。规避：恢复目标放到 CXL node（不同地址空间/不同 directory），或避免跨进程物理页复用。
+11. **每 lane 独立 DMA 端口**：`SimCkptDevice.dma` 改成 `VectorRequestPort`（仿 `CopyEngine`），每 queue 一个 `DmaPort`，`getPort("dma", idx)` 返回 `*dmaPorts[idx]`；`init()` 覆盖为只检查各 lane 端口连通（跳过 `DmaDevice::init()` 对继承单 `dmaPort` 的 panic）。x86_board 的 `attachIO`/`get_dma_ports` 逐个 `dma[i]` 接给独立 DMASequencer；`SouthBridge.attachIO` 用 `hasattr(dma_port, "elements")` 识别 vector 端口并跳过默认连接。
+12. **SimObject `.py` 是被 scons 编译进 gem5 的**（`build/X86/dev/x86/*.py.o`）：改 `SouthBridge.py` 等 python 后必须重新 `scons`，否则跑的还是旧字节码（表现为改了代码仍报旧错误）。
 
 ## 测试方法
 
@@ -233,6 +266,8 @@ chmod +x /tmp/img/home/test_code/ckptbench && sync && umount /tmp/img
 | P8 | `configs/example/gem5_library/x86-cxl-ckptd-p8.py` | 周期仿真抽样：save/resume/hit-rate/P95 实测 vs 模型预测对比 |
 | P9 | `make topology_scale && ./topology_scale`（宿主机，全量 512 MiB） | 条带均分 / bounds / 候选路径 / 完整状态机 |
 | P9 | `configs/example/gem5_library/x86-cxl-ckptd-p9.py --storage-channels N` | 显式拓扑 + 状态机 + N 通道条带平衡（guest 与设备统计交叉验证） |
+| P10 | `make p10_scale && ./p10_scale`（宿主机，全量 512 MiB） | 多队列均衡 split + 绝对 ring 绕环 + 乱序完成匹配 |
+| P10 | `configs/example/gem5_library/x86-cxl-ckptd-p10.py --storage-channels N --num-queues 2` | 多队列/多 lane 引擎 + 完整 8 条验收矩阵 + per-link 统计 |
 
 ```bash
 ./build/X86/gem5.opt -d m5out-p3 \

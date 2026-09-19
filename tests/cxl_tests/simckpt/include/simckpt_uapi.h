@@ -34,6 +34,18 @@
 #define SIMCKPT_REG_CQ_TAIL       0x60
 #define SIMCKPT_REG_ERRORS        0x68
 
+/* --- P10 multi-queue control + per-link statistics --------------------- */
+#define SIMCKPT_REG_QUEUE_SEL        0x70
+#define SIMCKPT_REG_NUM_QUEUES       0x78
+#define SIMCKPT_REG_Q_OUTSTANDING    0x80   /* read-only, selected queue     */
+#define SIMCKPT_REG_Q_RETRY          0x88   /* read-only, selected queue     */
+#define SIMCKPT_REG_Q_QUEUE_FULL     0x90   /* read-only, selected queue     */
+#define SIMCKPT_REG_Q_COMPLETED_BYTES 0x98  /* read-only, selected queue     */
+#define SIMCKPT_REG_Q_LATENCY_AVG    0xA0   /* read-only, selected queue     */
+#define SIMCKPT_REG_Q_LATENCY_P95    0xA8   /* read-only, selected queue     */
+#define SIMCKPT_REG_Q_ISSUE_TICK     0xB0   /* read-only, selected queue     */
+#define SIMCKPT_REG_Q_DONE_TICK      0xB8   /* read-only, selected queue     */
+
 /* --- Descriptor / completion entry sizes (cache-line sized, 64 B) ------ */
 #define SIMCKPT_DESC_SIZE  64
 #define SIMCKPT_CPL_SIZE   64
@@ -41,6 +53,8 @@
 /* --- Descriptor flags -------------------------------------------------- */
 #define SIMCKPT_FLAG_SAVE     (1u << 0)  /* memory(src) -> storage          */
 #define SIMCKPT_FLAG_RESTORE  (1u << 1)  /* storage -> memory(dst)         */
+#define SIMCKPT_FLAG_STAGE    (1u << 2)  /* GPU staging: generate PRNG      */
+                                         /* payload -> dst_addr (DRAM/CXL)  */
 
 /* --- Descriptor (submission queue entry), packed to 64 B --------------- */
 struct simckpt_desc {

@@ -110,7 +110,13 @@ class SouthBridge(SimObject):
             if attached_device is None:
                 continue
             attached_device.pio = bus.mem_side_ports
-            if dma_ports.count(attached_device.dma) == 0:
+            dma_port = attached_device.dma
+            # A vector DMA port (e.g. SimCkptDevice's per-lane queues) is
+            # connected element-by-element by the board; skip the default
+            # single-port connection.
+            if hasattr(dma_port, "elements"):
+                continue
+            if dma_ports.count(dma_port) == 0:
                 attached_device.dma = bus.cpu_side_ports
                 if hasattr(attached_device, 'cxl_rsp_port'):
                     attached_device.cxl_rsp_port = bus.mem_side_ports

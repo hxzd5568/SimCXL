@@ -297,6 +297,12 @@ P10：多队列/多主机 + 完整验收
 2. 多主机 CXL fabric、交换机、跨主机一致性放到后续阶段（当前 X86Board 只有一个 x86 系统 + 一个 CXLMemCtrl）。
 3. 跑完整验收矩阵 + 分链路统计（排队/带宽/延迟/重试）+ 论文级报告。
 
+P10 结果（见 exec_summary.md P10）：
+- 设备多队列 + 每 lane 独立 DMA 端口（`VectorRequestPort` → 每 lane 一个 Ruby DMASequencer）+ `FLAG_STAGE` GPU staging 描述符 + per-link（per-queue）BAR 只读统计（outstanding/retry/queue_full/completed_bytes/latency avg/p95/issue/done tick）。
+- guest 批量提交 + 中断就绪 + CRC 卸载（libckpt 新增 `simckpt_queue_init/submit_batch/wait_q/completions_q/get_qcounters`），`SIMCKPT_RING_DEPTH=16384`。
+- `ckptbench_p10` 跑完整 8 条验收矩阵：7/8 通过。#2（双内存路径 staging 带宽 > 最快单路径）受限于 DDR5 写缓冲（`write_buffer_size=64`）并发击穿——单 lane 各自 ~31 GB/s，但并发总带宽 ~25 GB/s。机制（每 lane 独立引擎）已交付，兑现 #2 需后续增大写缓冲/换更细 DRAM 模型。
+- 宿主机 `p10_scale.c`（512 MiB 全量，毫秒级）验证均衡 split + 绝对 ring 绕环 + 乱序完成匹配。
+
 【P8 实测发现：串行路径瓶颈在 guest 软件，应并入 P9/P10 优化项】
 - 现象：周期仿真里设备硬件每 chunk DMA 仅 ~10.7 µs（新增 `chunkLatency` 直方图，P95≈10.75 µs、1920 样本落在同一 131 ns 桶内）；但 guest 可见每 chunk 端到端 ~100 µs。差额 ~90 µs 是 guest 软件开销，而非硬件 DMA。
 - 根因（guest 侧，见 `tests/cxl_tests/simckpt/engine/libckpt.c`）：
