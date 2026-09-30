@@ -29,6 +29,7 @@ from .multi_channel import (
     DualChannelDDR3_1600,
     DualChannelDDR3_2133,
     DualChannelDDR4_2400,
+    DualChannelDDR5_4400,
     DualChannelLPDDR3_1600,
 )
 from .single_channel import (

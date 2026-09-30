@@ -179,8 +179,6 @@ SimCkptDevice::init()
         panic_if(!dmaPorts[q]->isConnected(),
                  "DMA lane port %u of %s not connected to anything!",
                  q, name());
-    // The inherited single dmaPort (DmaDevice) is unused; skip its
-    // connectivity check and run the PIO check directly.
     PioDevice::init();
 }
 
@@ -375,6 +373,15 @@ SimCkptDevice::postCompletion(int qIdx, Queue &q, Slot &slot)
     writeU32(b + 8, cplStatus);
     writeU32(b + 12, slot.crc);
 
+    if (q.pureStage) {
+        // E1 pure-write staging: skip the completion DMA-write and immediately
+        // complete the slot (0-delay), so only the payload write hits memory.
+        slot.state = State::WritingCpl;
+        schedule(slot.dmaDoneEvent, curTick());
+        q.cqTail++;
+        return;
+    }
+
     Addr cplAddr = q.cqBase + static_cast<uint64_t>(q.cqTail % q.cqDepth) *
                                 CPL_SIZE;
     slot.state = State::WritingCpl;
@@ -408,6 +415,27 @@ SimCkptDevice::tryFillSlots(int qIdx, Queue &q)
             stats.numQueueFull++;
             stats.qQueueFull[qIdx]++;
             break;
+        }
+
+        if (q.pureStage) {
+            // E1 pure-write staging: skip the descriptor DMA-read and directly
+            // synthesize a sequential payload write to stageBase + i*chunk.
+            free->desc = Descriptor{};
+            free->state = State::Writing;
+            free->issueTick = curTick();
+            free->desc.dst_addr = q.stageBase +
+                static_cast<uint64_t>(q.pureChunkIdx) * maxChunkSize;
+            free->desc.length = static_cast<uint32_t>(maxChunkSize);
+            free->desc.checkpoint_id = 1;
+            free->desc.chunk_id = q.pureChunkIdx;
+            free->desc.flags = FLAG_STAGE;
+            q.pureChunkIdx++;
+            generatePayload(*free);
+            dmaPorts[qIdx]->dmaAction(MemCmd::WriteReq, free->desc.dst_addr,
+                                      free->desc.length, &free->dmaDoneEvent,
+                                      free->dataBuf.data(), 0);
+            q.sqHead++;
+            continue;
         }
 
         free->state = State::FetchDesc;
@@ -567,6 +595,8 @@ SimCkptDevice::read(PacketPtr pkt)
       case REG_Q_LATENCY_P95: value = queueLatencyP95(q); break;
       case REG_Q_ISSUE_TICK: value = q.firstIssueTick; break;
       case REG_Q_DONE_TICK: value = q.lastCompletionTick; break;
+      case REG_STAGE_BASE: value = q.stageBase; break;
+      case REG_STAGE_MODE: value = q.pureStage ? 1 : 0; break;
       default:              value = 0; break;
     }
 
@@ -609,6 +639,7 @@ SimCkptDevice::write(PacketPtr pkt)
         break;
       case REG_SQ_DOORBELL:
         selectedQueue().sqTail = value;
+        selectedQueue().pureChunkIdx = 0;
         DPRINTF(SimCkptDevice, "doorbell queue=%u sqTail=%u\n",
                 queueSel, selectedQueue().sqTail);
         tryFillSlots(queueSel, selectedQueue());
@@ -618,6 +649,12 @@ SimCkptDevice::write(PacketPtr pkt)
         break;
       case REG_INTR_EN:
         selectedQueue().intrEnable = (value & 1) != 0;
+        break;
+      case REG_STAGE_BASE:
+        selectedQueue().stageBase = value;
+        break;
+      case REG_STAGE_MODE:
+        selectedQueue().pureStage = (value & 1) != 0;
         break;
       default:
         break;

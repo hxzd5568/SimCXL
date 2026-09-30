@@ -61,6 +61,7 @@ CXL 内存从 [0x100000000 (line 136)](C:/Users/32575/Documents/paper/tmp/SimCXL
 │       ├─ channel 1：带宽/延迟/队列/数据                         │
 │       └─ channel N                                             │
 └────────────────────────────────────────────────────────────────┘
+
 建议第一版把 GPU DMA 和存储 DMA 做成一个多队列 PCI 设备，减少驱动开发量。模型稳定后再拆成 GPU PCI function 和存储 PCI function。
 三、模块组成
 模块	所在位置	作用

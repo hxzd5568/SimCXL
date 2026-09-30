@@ -46,6 +46,10 @@
 #define SIMCKPT_REG_Q_ISSUE_TICK     0xB0   /* read-only, selected queue     */
 #define SIMCKPT_REG_Q_DONE_TICK      0xB8   /* read-only, selected queue     */
 
+/* --- E1 pure-write staging mode (per selected queue) -------------------- */
+#define SIMCKPT_REG_STAGE_BASE       0xC0   /* rw: pure-stage dst base addr */
+#define SIMCKPT_REG_STAGE_MODE       0xC8   /* rw: 1 = pure-stage, 0 = norm */
+
 /* --- Descriptor / completion entry sizes (cache-line sized, 64 B) ------ */
 #define SIMCKPT_DESC_SIZE  64
 #define SIMCKPT_CPL_SIZE   64

@@ -35,13 +35,14 @@ from m5.objects import (
     AddrRange,
     BaseXBar,
     Bridge,
+    CowDiskImage,
     CXLBridge,
     CXLMemCtrl,
-    CowDiskImage,
     IdeDisk,
     IOXBar,
     ParallelStorage,
     Pc,
+    PcieLink,
     Port,
     RawDiskImage,
     SimCkptDevice,
@@ -108,18 +109,44 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
     def _setup_board(self) -> None:
         self.pc = Pc()
         # cxl_device is dynamically initialized and attached
-        self.pc.south_bridge.cxl_device = CXLMemCtrl(pci_func=0, pci_dev=6, pci_bus=0)
+        self.pc.south_bridge.cxl_device = CXLMemCtrl(
+            pci_func=0, pci_dev=6, pci_bus=0
+        )
         if self._add_simckpt_device:
             self.pc.south_bridge.simckpt_device = SimCkptDevice(
                 pci_func=0, pci_dev=7, pci_bus=0
             )
             self.simckpt_storage = ParallelStorage(
-                size="64MiB", num_channels=2, chunk_size="4KiB",
-                queue_depth=64
+                size="64MiB", num_channels=2, chunk_size="4KiB", queue_depth=64
             )
             self.pc.south_bridge.simckpt_device.storage_port = (
                 self.simckpt_storage.port
             )
+            # Two independent PCIe lines (one per DMA lane): the DRAM lane (q0)
+            # and the CXL lane (q1) each get their own bandwidth-limited
+            # PcieLink, so they no longer contend on a single switch uplink
+            # (target2 E0). Each link models the real PCIe physical layer:
+            # 128b/130b encoding + TLP header/LCRC/framing/DLLP overhead on the
+            # write-data direction (NO CXL.mem 68B flit accounting: the CXL line
+            # is pure TLP, same formula as the DRAM line); responses/ACKs pass.
+            #
+            # Effective Gen5 x16 = 32 GT/s x16 x128/130 x 256/(256+35)
+            #                  = 63.02 GB/s x 0.8797 ~= 55.5 GB/s  (target 55.53)
+            num_queues = self.pc.south_bridge.simckpt_device.num_queues
+            self._simckpt_pcie_links = []
+            for i in range(num_queues):
+                link = PcieLink(
+                    req_size=1024,
+                    resp_size=1024,
+                    line_rate_gtps=32,  # GT/s per lane (Gen5=32, Gen4=16)
+                    num_lanes=16,  # x16
+                    max_payload_bytes=256,  # device MaxPayloadSize
+                    tlp_overhead_bytes=35,  # header(16)+LCRC(4)+framing/DLLP
+                    delay="0ns",
+                )
+                self._simckpt_pcie_links.append(link)
+                setattr(self, f"simckpt_pcie_link{i}", link)
+                self.pc.south_bridge.simckpt_device.dma[i] = link.cpu_side_port
 
         self.workload = X86FsLinux()
 
@@ -166,10 +193,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         if self.get_cache_hierarchy().is_ruby():
             dma_ports = [self.pc.south_bridge.ide.dma, cxl_mem_ctrl.dma]
             if hasattr(self.pc.south_bridge, "simckpt_device"):
-                for i in range(
-                    self.pc.south_bridge.simckpt_device.num_queues
-                ):
-                    dma_ports.append(self.pc.south_bridge.simckpt_device.dma[i])
+                # Each lane's independent PCIe uplink (PcieLink) is the DMA
+                # source for the Ruby system, not the per-queue device DMA ports.
+                for link in self._simckpt_pcie_links:
+                    dma_ports.append(link.mem_side_port)
             self.pc.attachIO(self.get_io_bus(), dma_ports)
         else:
             # # Constants similar to x86_traits.hh
@@ -179,7 +206,12 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             APIC_range_size = 1 << 12
 
             # Configure CXLBridge
-            self.bridge = CXLBridge(bridge_lat="50ns", proto_proc_lat="12ns", req_fifo_depth=128, resp_fifo_depth=128)
+            self.bridge = CXLBridge(
+                bridge_lat="50ns",
+                proto_proc_lat="12ns",
+                req_fifo_depth=128,
+                resp_fifo_depth=128,
+            )
             self.bridge.mem_side_port = self.get_io_bus().cpu_side_ports
             self.bridge.cpu_side_port = (
                 self.get_cache_hierarchy().get_mem_side_port()
@@ -191,7 +223,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                     IO_address_space_base, interrupts_address_space_base - 1
                 ),
                 AddrRange(pci_config_address_space_base, Addr.max),
-                cxl_mem_range
+                cxl_mem_range,
             ]
 
             self.apicbridge = Bridge(delay="50ns")
@@ -304,15 +336,13 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
         gpu_test_reserve = toMemorySize("64MiB")
 
-        cxl_linux_visible_size = (
-            cxl_mem_range.size() - gpu_test_reserve
-        )
+        cxl_linux_visible_size = cxl_mem_range.size() - gpu_test_reserve
 
         entries.append(
             X86E820Entry(
                 addr=0x100000000,
                 size=f"{cxl_linux_visible_size}B",
-                range_type=20
+                range_type=20,
             )
         )
 
@@ -332,11 +362,14 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
     @overrides(AbstractSystemBoard)
     def get_dma_ports(self) -> Sequence[Port]:
-        ports = [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports, 
-                self.pc.south_bridge.cxl_device.dma]
+        ports = [
+            self.pc.south_bridge.ide.dma,
+            self.iobus.mem_side_ports,
+            self.pc.south_bridge.cxl_device.dma,
+        ]
         if hasattr(self.pc.south_bridge, "simckpt_device"):
-            for i in range(self.pc.south_bridge.simckpt_device.num_queues):
-                ports.append(self.pc.south_bridge.simckpt_device.dma[i])
+            for link in self._simckpt_pcie_links:
+                ports.append(link.mem_side_port)
         return ports
 
     @overrides(AbstractSystemBoard)

@@ -28,7 +28,7 @@
 extern "C" {
 #endif
 
-#define SIMCKPT_RING_DEPTH 16384
+#define SIMCKPT_RING_DEPTH 131072
 #define SIMCKPT_MAX_QUEUES 8
 
 struct simckpt_ctx;
@@ -86,6 +86,14 @@ int simckpt_queue_init(struct simckpt_ctx *ctx, int q, int enable_intr);
 int simckpt_submit_batch(struct simckpt_ctx *ctx, int q,
                          const struct simckpt_desc *desc, uint32_t n);
 
+/* Copy `n` descriptors into queue `q`'s SQ (no doorbell). Pair with
+ * simckpt_ring() to start two lanes back-to-back. */
+int simckpt_submit_batch_noring(struct simckpt_ctx *ctx, int q,
+                                const struct simckpt_desc *desc, uint32_t n);
+
+/* Ring queue `q`'s doorbell with its current SQ tail. */
+int simckpt_ring(struct simckpt_ctx *ctx, int q);
+
 /* Block until queue `q` posts at least `target` absolute completions. */
 int simckpt_wait_q(struct simckpt_ctx *ctx, int q, uint64_t target);
 
@@ -97,6 +105,18 @@ int simckpt_completions_q(struct simckpt_ctx *ctx, int q,
 /* Read queue `q`'s per-link statistics. */
 int simckpt_get_qcounters(struct simckpt_ctx *ctx, int q,
                           struct simckpt_qcounters *c);
+
+/* E1 pure-write staging: set the destination base physical address for
+ * queue `q` and enable/disable the pure-stage mode (skips descriptor fetch
+ * and completion write; device writes payload to base + i*chunk_size). */
+int simckpt_set_stage_base(struct simckpt_ctx *ctx, int q, uint64_t base);
+int simckpt_set_pure_stage(struct simckpt_ctx *ctx, int q, int enable);
+
+/* E1 pure-write staging: ring queue `q`'s doorbell for `n` chunks without
+ * copying any descriptor into the SQ (pure-stage mode ignores the SQ), so
+ * two lanes can be started back-to-back with no guest-side memcpy between
+ * them. */
+int simckpt_stage_doorbell(struct simckpt_ctx *ctx, int q, uint32_t n);
 
 /* CRC32 (IEEE 802.3, matches the device). */
 uint32_t simckpt_crc32(const void *data, size_t len);

@@ -67,6 +67,11 @@ SimObject('SimCkpt.py', sim_objects=['SimCkptDevice'])
 Source('sim_ckpt_device.cc')
 DebugFlag('SimCkptDevice')
 
+# PCIe/CXL uplink bandwidth model (single unidirectional throttled link)
+SimObject('PcieLink.py', sim_objects=['PcieLink'])
+Source('pcie_link.cc')
+DebugFlag('PcieLink')
+
 # Parallel multi-channel flash storage
 SimObject('ParallelStorage.py', sim_objects=['ParallelStorage'])
 Source('parallel_storage.cc')

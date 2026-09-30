@@ -43,18 +43,18 @@ import argparse
 #     restore hot      ~ 14 us   (P5: 100% hot 512 chunks / 6.999 ms)
 #   ~1 ms DMA pipeline cold start + tail drain (readme_cxl.md)
 # --------------------------------------------------------------------------
-B_GPU_DRAM   = 30e9
-B_GPU_CXL    = 30e9
-B_DRAM_READ  = 29e9
-B_CXL_READ   = 20e9
+B_GPU_DRAM = 30e9
+B_GPU_CXL = 30e9
+B_DRAM_READ = 29e9
+B_CXL_READ = 20e9
 B_DRAM_WRITE = 29e9
-B_CXL_WRITE  = 30e9
-B_CHANNEL    = 7.2e9
+B_CXL_WRITE = 30e9
+B_CHANNEL = 7.2e9
 
-T_SAVE_CHUNK        = 98e-6
-T_RESTORE_COLD      = 102e-6
-T_RESTORE_HOT       = 14e-6
-T_STARTUP           = 1e-3
+T_SAVE_CHUNK = 98e-6
+T_RESTORE_COLD = 102e-6
+T_RESTORE_HOT = 14e-6
+T_STARTUP = 1e-3
 
 # topology identifiers (match trace_gen.h)
 TOPOLOGY = {"dram": 0, "cxl": 1, "both": 2}
@@ -81,17 +81,73 @@ def mem_egress(topology):
 
 def bsave_bound(topology, n_channels):
     """Steady-state save bandwidth bound (B/s), target.md section 5."""
-    return min(gpu_ingress(topology), mem_egress(topology),
-               n_channels * B_CHANNEL)
+    return min(
+        gpu_ingress(topology), mem_egress(topology), n_channels * B_CHANNEL
+    )
 
 
 def bresume_bound(topology, n_channels):
     """Steady-state restore (cold) bandwidth bound (B/s)."""
-    landing = {0: B_DRAM_WRITE, 1: B_CXL_WRITE,
-               2: B_DRAM_WRITE + B_CXL_WRITE}[topology]
-    gpu_read = {0: B_DRAM_READ, 1: B_CXL_READ,
-                2: B_DRAM_READ + B_CXL_READ}[topology]
+    landing = {0: B_DRAM_WRITE, 1: B_CXL_WRITE, 2: B_DRAM_WRITE + B_CXL_WRITE}[
+        topology
+    ]
+    gpu_read = {0: B_DRAM_READ, 1: B_CXL_READ, 2: B_DRAM_READ + B_CXL_READ}[
+        topology
+    ]
     return min(n_channels * B_CHANNEL, landing, gpu_read)
+
+
+# --------------------------------------------------------------------------
+# target2 (two independent PCIe lines) model.
+#
+# Calibrated/derived numbers (exec_summary_v2.md / target2.md v2):
+#   Gen5 x16 effective = 55.53 GB/s (raw 64, 128b/130b + TLP overhead, no flit)
+#   Gen4 x16 effective = 27.77 GB/s (same efficiency ~86.8%)
+#   DDR5 32-bit subchannel = 17.6 GB/s; CXL expander backend = 4 DIMM x 50 = 200
+#   S1 (1 GPU, 1 DRAM ch + 1 CXL ch): single ~17.6, dual ~27.77 (GPU link) = 1.58x
+#   S2 (4 GPU): DRAM-only 55.53 (uplink), dual 111 (2 lines) = 2.0x
+# --------------------------------------------------------------------------
+PCIE_GEN4_X16 = 27.77e9  # per-GPU link (effective)
+PCIE_GEN5_X16 = 55.53e9  # switch uplink AND expander link (effective)
+DDR5_SUBCH = 17.6e9  # one 32-bit DDR5 subchannel
+CXL_BACKEND = 200e9  # expander backend (4 DIMM x 50 GB/s)
+
+
+def s1_dual_bound():
+    """S1: single GPU, one DRAM channel + one CXL channel, two independent
+    lines. Single path is channel-limited; dual is limited by the GPU's own
+    Gen4 x16 link (27.77 GB/s effective)."""
+    single = DDR5_SUBCH
+    dual = min(PCIE_GEN4_X16, 2 * DDR5_SUBCH)
+    return {
+        "single_gbs": single / 1e9,
+        "dual_gbs": dual / 1e9,
+        "speedup": dual / single,
+    }
+
+
+def s2_dual_bound(n_gpu=4, n_dram_ch=8, n_cxl_ch=8):
+    """S2: N GPUs staging to host DRAM (through the shared switch uplink) and
+    to CXL expander (direct Gen5 x16, on-device DMA, no uplink, no flit).
+
+    DRAM-only: all GPUs -> uplink -> DRAM, so B = min(N*GPU_link, uplink, DRAM).
+    Dual: split across DRAM (uplink) + CXL expander (P2P)."""
+    gpu_egress = n_gpu * PCIE_GEN4_X16
+    uplink = PCIE_GEN5_X16
+    dram_bw = n_dram_ch * DDR5_SUBCH
+    cxl_bw = CXL_BACKEND  # backend no longer a bottleneck
+
+    dram_only_bw = min(gpu_egress, uplink, dram_bw)
+    # dual: half the GPUs go DRAM (uplink), half go CXL (expander, P2P)
+    dram_share = min((n_gpu // 2) * PCIE_GEN4_X16, uplink, dram_bw)
+    cxl_share = min((n_gpu - n_gpu // 2) * PCIE_GEN4_X16, cxl_bw)
+    dual_bw = dram_share + cxl_share
+
+    return {
+        "dram_only_gbs": dram_only_bw / 1e9,
+        "dual_gbs": dual_bw / 1e9,
+        "speedup": dual_bw / dram_only_bw,
+    }
 
 
 def gen_trace(size_bytes, chunk_size, interval, num_ckpts, hot_frac):
@@ -103,9 +159,14 @@ def gen_trace(size_bytes, chunk_size, interval, num_ckpts, hot_frac):
     """
     n_chunks = size_bytes // chunk_size
     hot_cap = int(round(hot_frac * n_chunks))
-    events = [{"step": (i + 1) * interval, "ckpt_id": i + 1,
-               "size_bytes": size_bytes}
-              for i in range(num_ckpts)]
+    events = [
+        {
+            "step": (i + 1) * interval,
+            "ckpt_id": i + 1,
+            "size_bytes": size_bytes,
+        }
+        for i in range(num_ckpts)
+    ]
     return {
         "chunk_size": chunk_size,
         "n_chunks": n_chunks,
@@ -186,10 +247,13 @@ def fmt_gbs(bw):
 
 
 def sweep():
-    print("Steady-state save bandwidth bound  Bsave <= min(ingress, egress, storage)")
+    print(
+        "Steady-state save bandwidth bound  Bsave <= min(ingress, egress, storage)"
+    )
     print("=" * 78)
     header = f"{'topology':>8} | " + " | ".join(
-        f"{n:>2}ch" for n in (1, 2, 4, 8))
+        f"{n:>2}ch" for n in (1, 2, 4, 8)
+    )
     print(header)
     print("-" * 78)
     for topo in (0, 1, 2):
@@ -209,43 +273,71 @@ def sweep():
         print(row)
 
 
-def predict_trace(size_mib, num_ckpts, hot_frac, chunk_size=4096,
-                  interval=1, topology=2, n_channels=2):
+def predict_trace(
+    size_mib,
+    num_ckpts,
+    hot_frac,
+    chunk_size=4096,
+    interval=1,
+    topology=2,
+    n_channels=2,
+):
     size_bytes = size_mib << 20
     trace = gen_trace(size_bytes, chunk_size, interval, num_ckpts, hot_frac)
     s = predict_serial(trace, topology, n_channels)
     b = predict_bound(trace, topology, n_channels)
 
-    print(f"trace: {num_ckpts} ckpts x {size_mib} MiB, chunk {chunk_size} B, "
-          f"hot_frac {hot_frac:.2f}, topology={TOPOLOGY_NAME[topology]}, "
-          f"{n_channels} storage channels")
-    print("  [serial / latency-limited]  save %.3f ms  save-bw %s  "
-          "resume %.3f ms  hit-rate %.2f  p95 %.1f us"
-          % (s["save_time"] * 1e3, fmt_gbs(s["save_bw"]),
-             s["resume_time"] * 1e3, s["hit_rate"], s["p95_chunk"] * 1e6))
-    print("  [bound / bandwidth-limited] save %.3f ms  save-bw %s  "
-          "resume %.3f ms  hit-rate %.2f"
-          % (b["save_time"] * 1e3, fmt_gbs(b["save_bw"]),
-             b["resume_time"] * 1e3, b["hit_rate"]))
+    print(
+        f"trace: {num_ckpts} ckpts x {size_mib} MiB, chunk {chunk_size} B, "
+        f"hot_frac {hot_frac:.2f}, topology={TOPOLOGY_NAME[topology]}, "
+        f"{n_channels} storage channels"
+    )
+    print(
+        "  [serial / latency-limited]  save %.3f ms  save-bw %s  "
+        "resume %.3f ms  hit-rate %.2f  p95 %.1f us"
+        % (
+            s["save_time"] * 1e3,
+            fmt_gbs(s["save_bw"]),
+            s["resume_time"] * 1e3,
+            s["hit_rate"],
+            s["p95_chunk"] * 1e6,
+        )
+    )
+    print(
+        "  [bound / bandwidth-limited] save %.3f ms  save-bw %s  "
+        "resume %.3f ms  hit-rate %.2f"
+        % (
+            b["save_time"] * 1e3,
+            fmt_gbs(b["save_bw"]),
+            b["resume_time"] * 1e3,
+            b["hit_rate"],
+        )
+    )
     return trace, s, b
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--trace", nargs="+", type=float,
-                    help="size_mib num_ckpts hot_frac")
+    ap.add_argument(
+        "--trace", nargs="+", type=float, help="size_mib num_ckpts hot_frac"
+    )
     ap.add_argument("--channels", type=int, default=2)
-    ap.add_argument("--topology", choices=("dram", "cxl", "both"),
-                    default="both")
+    ap.add_argument(
+        "--topology", choices=("dram", "cxl", "both"), default="both"
+    )
     args = ap.parse_args()
 
     sweep()
 
     if args.trace:
         size_mib, num_ckpts, hot_frac = args.trace
-        predict_trace(int(size_mib), int(num_ckpts), hot_frac,
-                      topology=TOPOLOGY[args.topology],
-                      n_channels=args.channels)
+        predict_trace(
+            int(size_mib),
+            int(num_ckpts),
+            hot_frac,
+            topology=TOPOLOGY[args.topology],
+            n_channels=args.channels,
+        )
 
 
 if __name__ == "__main__":

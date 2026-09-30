@@ -153,20 +153,30 @@ class MESITwoLevelCacheHierarchy(
             for range, port in board.get_mem_ports()
         ]
         cxl_mem_ctrl = board.pc.south_bridge.cxl_device
-        self._directory_controllers.append(Directory(self.ruby_system.network, 
-            cache_line_size, cxl_mem_ctrl.cxl_mem_range, cxl_mem_ctrl.cxl_rsp_port))
+        self._directory_controllers.append(
+            Directory(
+                self.ruby_system.network,
+                cache_line_size,
+                cxl_mem_ctrl.cxl_mem_range,
+                cxl_mem_ctrl.cxl_rsp_port,
+            )
+        )
 
         # TODO: Make this prettier: The problem is not being able to proxy
         # the ruby system correctly
         for dir in self._directory_controllers:
             dir.ruby_system = self.ruby_system
+            dir.number_of_TBEs = 1024
 
         self._dma_controllers = []
         if board.has_dma_ports():
             dma_ports = board.get_dma_ports()
             for i, port in enumerate(dma_ports):
                 ctrl = DMAController(self.ruby_system.network, cache_line_size)
-                ctrl.dma_sequencer = DMASequencer(version=i, in_ports=port)
+                ctrl.number_of_TBEs = 1024
+                ctrl.dma_sequencer = DMASequencer(
+                    version=i, in_ports=port, max_outstanding_requests=512
+                )
                 self._dma_controllers.append(ctrl)
                 ctrl.ruby_system = self.ruby_system
 

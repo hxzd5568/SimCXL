@@ -42,3 +42,6 @@ typings
 include/cxl_benchmark/lmbench3
 /output
 m5out-*/
+.venv/
+/tests/cxl_tests/simckpt/ckptbench_e1
+/tests/cxl_tests/simckpt/ckptbench_e4_s1

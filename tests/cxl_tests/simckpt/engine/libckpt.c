@@ -309,8 +309,8 @@ simckpt_queue_init(struct simckpt_ctx *ctx, int q, int enable_intr)
 }
 
 int
-simckpt_submit_batch(struct simckpt_ctx *ctx, int q,
-                     const struct simckpt_desc *desc, uint32_t n)
+simckpt_submit_batch_noring(struct simckpt_ctx *ctx, int q,
+                            const struct simckpt_desc *desc, uint32_t n)
 {
     if (!ctx || !desc || n == 0 || q < 0 || q >= ctx->n_queues)
         return -EINVAL;
@@ -328,10 +328,33 @@ simckpt_submit_batch(struct simckpt_ctx *ctx, int q,
         memcpy(&qs->sq[slot], &desc[i], SIMCKPT_DESC_SIZE);
     }
     qs->tail = start + n;
+    return 0;
+}
 
+/* Ring queue q's doorbell with its current tail, without copying descriptors.
+ * Used to start two lanes back-to-back (memcpy both, then ring both), so the
+ * second lane's start is not delayed by the first lane's descriptor memcpy. */
+int
+simckpt_ring(struct simckpt_ctx *ctx, int q)
+{
+    if (!ctx || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    struct simckpt_qstate *qs = &ctx->q[q];
+    if (!qs->programmed)
+        return -EIO;
     select_queue(ctx, q);
     bar_wq(ctx, SIMCKPT_REG_SQ_DOORBELL, qs->tail);
     return 0;
+}
+
+int
+simckpt_submit_batch(struct simckpt_ctx *ctx, int q,
+                     const struct simckpt_desc *desc, uint32_t n)
+{
+    int rc = simckpt_submit_batch_noring(ctx, q, desc, n);
+    if (rc)
+        return rc;
+    return simckpt_ring(ctx, q);
 }
 
 int
@@ -375,6 +398,42 @@ simckpt_get_qcounters(struct simckpt_ctx *ctx, int q,
     c->latency_p95     = bar_rq(ctx, SIMCKPT_REG_Q_LATENCY_P95);
     c->issue_tick      = bar_rq(ctx, SIMCKPT_REG_Q_ISSUE_TICK);
     c->done_tick       = bar_rq(ctx, SIMCKPT_REG_Q_DONE_TICK);
+    return 0;
+}
+
+int
+simckpt_set_stage_base(struct simckpt_ctx *ctx, int q, uint64_t base)
+{
+    if (!ctx || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    select_queue(ctx, q);
+    bar_wq(ctx, SIMCKPT_REG_STAGE_BASE, base);
+    return 0;
+}
+
+int
+simckpt_set_pure_stage(struct simckpt_ctx *ctx, int q, int enable)
+{
+    if (!ctx || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+    select_queue(ctx, q);
+    bar_wq(ctx, SIMCKPT_REG_STAGE_MODE, enable ? 1 : 0);
+    return 0;
+}
+
+int
+simckpt_stage_doorbell(struct simckpt_ctx *ctx, int q, uint32_t n)
+{
+    if (!ctx || n == 0 || q < 0 || q >= ctx->n_queues)
+        return -EINVAL;
+
+    struct simckpt_qstate *qs = &ctx->q[q];
+    if (!qs->programmed)
+        return -EIO;
+
+    qs->tail += n;
+    select_queue(ctx, q);
+    bar_wq(ctx, SIMCKPT_REG_SQ_DOORBELL, qs->tail);
     return 0;
 }
 

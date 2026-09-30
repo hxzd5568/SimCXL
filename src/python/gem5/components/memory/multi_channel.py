@@ -32,6 +32,7 @@ from .dram_interfaces.ddr3 import (
     DDR3_2133_8x8,
 )
 from .dram_interfaces.ddr4 import DDR4_2400_8x8
+from .dram_interfaces.ddr5 import DDR5_4400_4x8
 from .dram_interfaces.hbm import HBM_1000_4H_1x64
 from .dram_interfaces.lpddr3 import LPDDR3_1600_1x32
 from .memory import ChanneledMemory
@@ -62,6 +63,19 @@ def DualChannelDDR4_2400(
     A dual channel memory system using DDR4_2400_8x8 based DIMM.
     """
     return ChanneledMemory(DDR4_2400_8x8, 2, 64, size=size)
+
+
+def DualChannelDDR5_4400(
+    size: Optional[str] = None,
+) -> AbstractMemorySystem:
+    """
+    A dual-channel (2 x 64-bit) DDR5-4400 memory system.
+
+    DDR5_4400_4x8 models a single 32-bit subchannel (~17.6 GB/s), so a single
+    64-bit DDR5 channel (a DIMM's two subchannels) is 2 of them (~35.2 GB/s)
+    and true dual-channel is 4 of them (~70.4 GB/s).
+    """
+    return ChanneledMemory(DDR5_4400_4x8, 4, 64, size=size)
 
 
 def DualChannelLPDDR3_1600(

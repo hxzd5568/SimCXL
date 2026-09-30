@@ -113,6 +113,9 @@ class SimCkptDevice : public PciDevice
         REG_Q_LATENCY_P95  = 0xA8,
         REG_Q_ISSUE_TICK   = 0xB0,
         REG_Q_DONE_TICK    = 0xB8,
+        // E1 pure-write staging mode (per selected queue).
+        REG_STAGE_BASE     = 0xC0,
+        REG_STAGE_MODE     = 0xC8,
     };
 
     enum CtrlBits : uint64_t
@@ -174,6 +177,13 @@ class SimCkptDevice : public PciDevice
         Tick firstIssueTick = 0;
         Tick lastCompletionTick = 0;
 
+        // E1 pure-write staging mode: when `pureStage` is set, the device
+        // skips the descriptor DMA-read and the completion DMA-write and only
+        // issues sequential payload writes to stageBase + i*maxChunkSize.
+        Addr stageBase = 0;
+        bool pureStage = false;
+        uint32_t pureChunkIdx = 0;   // local chunk index, reset per doorbell
+
         std::vector<std::unique_ptr<Slot>> slots;
 
         // Per-link (per-queue) statistics, also mapped to read-only BAR regs.
@@ -227,9 +237,10 @@ class SimCkptDevice : public PciDevice
     // Port to the ParallelStorage backend (save/restore), shared across lanes.
     StoragePort storagePort;
 
-    // Per-lane DMA ports (one per queue): each lane gets its own Ruby
-    // DMASequencer so the GPU DMA lanes neither serialize nor contend on a
-    // single DMA engine.
+    // Per-lane DMA ports (one per queue): each lane gets its own PcieLink
+    // (placed by the board) and its own Ruby DMASequencer, so the DRAM lane
+    // and the CXL lane neither share the PCIe uplink nor serialize on a single
+    // DMA engine (target2 E0: two independent staging lines).
     std::vector<std::unique_ptr<DmaPort>> dmaPorts;
 
     // P10 multi-queue state.
