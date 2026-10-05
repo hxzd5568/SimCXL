@@ -40,6 +40,7 @@ from m5.objects import (
     CXLMemCtrl,
     IdeDisk,
     IOXBar,
+    NoncoherentXBar,
     ParallelStorage,
     Pc,
     PcieLink,
@@ -86,10 +87,18 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cxl_memory: AbstractMemorySystem,
         is_asic: bool = True,
         add_simckpt_device: bool = False,
+        simckpt_s2_topology: bool = False,
+        simckpt_num_queues: int = 2,
+        simckpt_num_dram_lanes: int = 0,
+        simckpt_num_cxl_lanes: int = 0,
     ) -> None:
         self._cxl_memory_ptr = cxl_memory
         self._is_asic = is_asic
         self._add_simckpt_device = add_simckpt_device
+        self._simckpt_s2 = simckpt_s2_topology
+        self._simckpt_num_queues = simckpt_num_queues
+        self._simckpt_num_dram_lanes = simckpt_num_dram_lanes
+        self._simckpt_num_cxl_lanes = simckpt_num_cxl_lanes
 
         super().__init__(
             clk_freq=clk_freq,
@@ -116,6 +125,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             self.pc.south_bridge.simckpt_device = SimCkptDevice(
                 pci_func=0, pci_dev=7, pci_bus=0
             )
+            self.pc.south_bridge.simckpt_device.num_queues = (
+                self._simckpt_num_queues
+            )
             self.simckpt_storage = ParallelStorage(
                 size="64MiB", num_channels=2, chunk_size="4KiB", queue_depth=64
             )
@@ -132,21 +144,87 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             #
             # Effective Gen5 x16 = 32 GT/s x16 x128/130 x 256/(256+35)
             #                  = 63.02 GB/s x 0.8797 ~= 55.5 GB/s  (target 55.53)
-            num_queues = self.pc.south_bridge.simckpt_device.num_queues
+            num_queues = self._simckpt_num_queues
             self._simckpt_pcie_links = []
-            for i in range(num_queues):
-                link = PcieLink(
+            self._simckpt_cxl_links = []
+            self._simckpt_uplink = None
+            self._simckpt_uplink_xbar = None
+
+            def _mk_link(line_rate_gtps, init_cmd_latency="0ns"):
+                return PcieLink(
                     req_size=1024,
                     resp_size=1024,
-                    line_rate_gtps=32,  # GT/s per lane (Gen5=32, Gen4=16)
+                    line_rate_gtps=line_rate_gtps,  # Gen5=32, Gen4=16
                     num_lanes=16,  # x16
                     max_payload_bytes=256,  # device MaxPayloadSize
                     tlp_overhead_bytes=35,  # header(16)+LCRC(4)+framing/DLLP
                     delay="0ns",
+                    init_cmd_latency=init_cmd_latency,
                 )
-                self._simckpt_pcie_links.append(link)
-                setattr(self, f"simckpt_pcie_link{i}", link)
-                self.pc.south_bridge.simckpt_device.dma[i] = link.cpu_side_port
+
+            if self._simckpt_s2:
+                # --- S2 topology (target2 E5): 4 GPU + shared switch uplink ---
+                # 4 GPU lanes each get their own Gen4 x16 link (27.77 GB/s,
+                # the per-GPU egress limit). Their DRAM-bound traffic fans in
+                # through a NoncoherentXBar into a single shared Gen5 x16
+                # switch uplink (55.53 GB/s) -> this is the multi-GPU shared
+                # uplink that becomes the bottleneck for DRAM-only staging.
+                # 2 CXL lanes each get a direct Gen5 x16 expander link (P2P,
+                # does NOT traverse the shared uplink) -> the on-device DMA
+                # data plane, which releases the uplink in dual-path mode.
+                n_dram = self._simckpt_num_dram_lanes or 4
+                n_cxl = self._simckpt_num_cxl_lanes or 2
+                assert n_dram + n_cxl == num_queues, (
+                    "S2 topology: num_dram_lanes + num_cxl_lanes must equal "
+                    "SimCkptDevice.num_queues"
+                )
+                dram_links = []
+                for i in range(n_dram):
+                    link = _mk_link(16)  # Gen4 x16 per-GPU link
+                    dram_links.append(link)
+                    self._simckpt_pcie_links.append(link)
+                    setattr(self, f"simckpt_pcie_link{i}", link)
+                    self.pc.south_bridge.simckpt_device.dma[
+                        i
+                    ] = link.cpu_side_port
+                # Shared Gen5 x16 switch uplink with a NoncoherentXBar fan-in
+                # of the 4 GPU DRAM lanes.
+                uplink = _mk_link(32)  # Gen5 x16 switch uplink
+                self._simckpt_uplink = uplink
+                setattr(self, "simckpt_uplink", uplink)
+                xbar = NoncoherentXBar(
+                    width=64,
+                    frontend_latency=1,
+                    forward_latency=0,
+                    response_latency=1,
+                    header_latency=1,
+                )
+                self._simckpt_uplink_xbar = xbar
+                setattr(self, "simckpt_uplink_xbar", xbar)
+                for link in dram_links:
+                    xbar.cpu_side_ports = link.mem_side_port
+                xbar.mem_side_ports = uplink.cpu_side_port
+                # 2 CXL P2P lanes (direct Gen5 x16, on-device DMA, no uplink).
+                for i in range(n_cxl):
+                    # The CXL lane carries a one-time CXL.io initial-command
+                    # latency (CPU->expander discovery/config/descriptor/
+                    # doorbell) before the data plane starts.
+                    link = _mk_link(32, init_cmd_latency="1us")
+                    self._simckpt_pcie_links.append(link)
+                    self._simckpt_cxl_links.append(link)
+                    qi = n_dram + i
+                    setattr(self, f"simckpt_pcie_link{qi}", link)
+                    self.pc.south_bridge.simckpt_device.dma[
+                        qi
+                    ] = link.cpu_side_port
+            else:
+                for i in range(num_queues):
+                    link = _mk_link(32)  # Gen5 x16 per-lane link (v2.1)
+                    self._simckpt_pcie_links.append(link)
+                    setattr(self, f"simckpt_pcie_link{i}", link)
+                    self.pc.south_bridge.simckpt_device.dma[
+                        i
+                    ] = link.cpu_side_port
 
         self.workload = X86FsLinux()
 
@@ -157,6 +235,20 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         self._setup_io_devices()
 
         self.m5ops_base = 0xFFFF0000
+
+    def _simckpt_ruby_dma_ports(self):
+        """Mem-side ports of the PcieLink(s) that enter the Ruby memory system.
+
+        In the default "independent" topology every per-lane link connects
+        directly to a Ruby DMASequencer. In the S2 topology the 4 GPU DRAM
+        lanes fan into the shared uplink first, so only the uplink's mem-side
+        port (plus the 2 CXL P2P lanes) reach Ruby.
+        """
+        if self._simckpt_s2:
+            return [self._simckpt_uplink.mem_side_port] + [
+                link.mem_side_port for link in self._simckpt_cxl_links
+            ]
+        return [link.mem_side_port for link in self._simckpt_pcie_links]
 
     def _setup_io_devices(self):
         """Sets up the x86 IO devices.
@@ -195,8 +287,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             if hasattr(self.pc.south_bridge, "simckpt_device"):
                 # Each lane's independent PCIe uplink (PcieLink) is the DMA
                 # source for the Ruby system, not the per-queue device DMA ports.
-                for link in self._simckpt_pcie_links:
-                    dma_ports.append(link.mem_side_port)
+                # In the S2 topology the DRAM lanes fan into the shared uplink
+                # first, so only the uplink + CXL lanes reach Ruby.
+                for port in self._simckpt_ruby_dma_ports():
+                    dma_ports.append(port)
             self.pc.attachIO(self.get_io_bus(), dma_ports)
         else:
             # # Constants similar to x86_traits.hh
@@ -368,8 +462,8 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             self.pc.south_bridge.cxl_device.dma,
         ]
         if hasattr(self.pc.south_bridge, "simckpt_device"):
-            for link in self._simckpt_pcie_links:
-                ports.append(link.mem_side_port)
+            for port in self._simckpt_ruby_dma_ports():
+                ports.append(port)
         return ports
 
     @overrides(AbstractSystemBoard)

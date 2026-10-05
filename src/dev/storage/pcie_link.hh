@@ -119,6 +119,16 @@ class PcieLink : public ClockedObject
     LinkResponsePort cpuSidePort;
     LinkRequestPort memSidePort;
 
+    // Write-direction serialization scale (models non-posted write
+    // completion): effective write bandwidth = read bandwidth / writeScale.
+    const double writeScale;
+
+    // One-time leading latency charged to the first request (models the
+    // CPU->expander CXL.io initial command time). Mutable so the request
+    // path can mark it consumed.
+    const Tick initCmdLatency;
+    bool firstReqSeen;
+
   public:
     PcieLink(const PcieLinkParams &p);
 

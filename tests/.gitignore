@@ -1,2 +1,3 @@
 testing-results
 gem5/resources
+tests/cxl_tests/simckpt/ckptbench_p*

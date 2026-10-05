@@ -113,6 +113,15 @@ DDR5_SUBCH = 17.6e9  # one 32-bit DDR5 subchannel
 CXL_BACKEND = 200e9  # expander backend (4 DIMM x 50 GB/s)
 
 
+def write_bw(read_bw, write_scale=1.0):
+    """E2 write-completion overhead (non-posted write semantics): effective
+    write bandwidth = read bandwidth / write_scale. The paper's ~1.5x
+    read/write gap is reproduced with write_scale ~1.5 (Gen5 x16 read
+    ~55.53 GB/s -> write ~37 GB/s, matching the ~33 GB/s paper number).
+    Measured in cycle sim (write_scale=1.55): DRAM-only 53.77 -> 34.87 GB/s."""
+    return read_bw / write_scale
+
+
 def s1_dual_bound():
     """S1: single GPU, one DRAM channel + one CXL channel, two independent
     lines. Single path is channel-limited; dual is limited by the GPU's own

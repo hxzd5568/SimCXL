@@ -82,3 +82,19 @@ class PcieLink(ClockedObject):
         "Per-TLP overhead (header + LCRC + framing + DLLP), amortised "
         "over max_payload_bytes",
     )
+    write_scale = Param.Float(
+        1.0,
+        "Write-direction serialization scale factor. A value >1 models the "
+        "PCIe non-posted write completion semantics (the write must wait for "
+        "a completion on the return path), so effective write bandwidth = "
+        "read bandwidth / write_scale. The paper's ~1.5x read/write gap is "
+        "reproduced with write_scale ~1.5 (write ~33 GB/s vs read ~51 GB/s "
+        "on a Gen5 x16 link).",
+    )
+    init_cmd_latency = Param.Latency(
+        "0ns",
+        "One-time leading latency charged to the very first request passing "
+        "through the link. Models the CPU->expander CXL.io initial command "
+        "time (discovery/config/DMA-descriptor/doorbell) before the data "
+        "plane starts; it does not affect steady-state bandwidth.",
+    )

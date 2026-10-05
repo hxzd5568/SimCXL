@@ -90,7 +90,10 @@ PcieLink::PcieLink(const PcieLinkParams &p)
                   computeTickPerByte(p.line_rate_gtps, p.num_lanes,
                                      p.tlp_overhead_bytes,
                                      p.max_payload_bytes),
-                  p.req_size)
+                  p.req_size),
+      writeScale(p.write_scale),
+      initCmdLatency(p.init_cmd_latency),
+      firstReqSeen(false)
 {
 }
 
@@ -169,9 +172,22 @@ PcieLink::LinkResponsePort::recvTimingReq(PacketPtr pkt)
         if (!retryReq) {
             pkt->headerDelay = pkt->payloadDelay = 0;
 
-            // Serialize the write data at `bandwidth * efficiency`.
-            Tick serialization = (Tick)(pkt->getSize() * tickPerByte);
-            Tick t = curTick() + delay + serialization;
+            // Serialize the write data at `bandwidth * efficiency`. Writes
+            // are additionally scaled by `writeScale` to model non-posted
+            // write completion semantics (write completion return occupies
+            // the link), so write bandwidth = read bandwidth / writeScale.
+            double scale = pkt->isWrite() ? link.writeScale : 1.0;
+            Tick serialization = (Tick)(pkt->getSize() * tickPerByte * scale);
+
+            // One-time leading latency for the very first request (CXL.io
+            // initial command time); consumed after the first request.
+            Tick lead = 0;
+            if (!link.firstReqSeen) {
+                link.firstReqSeen = true;
+                lead = link.initCmdLatency;
+            }
+
+            Tick t = curTick() + delay + lead + serialization;
             memPort.schedTimingReq(pkt, t);
         }
     }
@@ -215,7 +231,11 @@ PcieLink::LinkRequestPort::trySendTiming()
 
         if (!transmitList.empty()) {
             // Space the next request by this packet's serialization time.
-            Tick serialization = (Tick)(pkt->getSize() * tickPerByte);
+            // Apply the write-completion scale so writes are throttled by
+            // `writeScale` (non-posted write completion return occupies the
+            // link), matching the acceptance-side serialization above.
+            double scale = pkt->isWrite() ? link.writeScale : 1.0;
+            Tick serialization = (Tick)(pkt->getSize() * tickPerByte * scale);
             Tick t = curTick() + serialization;
             link.schedule(sendEvent, std::max(transmitList.front().second, t));
         }
@@ -243,7 +263,8 @@ PcieLink::LinkResponsePort::trySendTiming()
         --outstandingResponses;
 
         if (!transmitList.empty())
-            link.schedule(sendEvent, transmitList.front().second);
+            link.schedule(sendEvent,
+                          std::max(transmitList.front().second, curTick()));
 
         if (!memPort.reqQueueFull() && retryReq) {
             retryReq = false;
