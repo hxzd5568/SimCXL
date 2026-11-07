@@ -29,7 +29,7 @@ extern "C" {
 #endif
 
 #define SIMCKPT_RING_DEPTH 131072
-#define SIMCKPT_MAX_QUEUES 8
+#define SIMCKPT_MAX_QUEUES 16
 
 struct simckpt_ctx;
 

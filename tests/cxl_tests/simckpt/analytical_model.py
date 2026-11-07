@@ -144,7 +144,7 @@ def s2_dual_bound(n_gpu=4, n_dram_ch=8, n_cxl_ch=8):
     gpu_egress = n_gpu * PCIE_GEN4_X16
     uplink = PCIE_GEN5_X16
     dram_bw = n_dram_ch * DDR5_SUBCH
-    cxl_bw = CXL_BACKEND  # backend no longer a bottleneck
+    cxl_bw = min(PCIE_GEN5_X16, n_cxl_ch * DDR5_SUBCH)  # link-limited ceiling
 
     dram_only_bw = min(gpu_egress, uplink, dram_bw)
     # dual: half the GPUs go DRAM (uplink), half go CXL (expander, P2P)
@@ -157,6 +157,98 @@ def s2_dual_bound(n_gpu=4, n_dram_ch=8, n_cxl_ch=8):
         "dual_gbs": dual_bw / 1e9,
         "speedup": dual_bw / dram_only_bw,
     }
+
+
+# --------------------------------------------------------------------------
+# target2 budget study: sweep the CXL *memory budget* (GB) -> backend
+# bandwidth -> effective CXL line rate -> optimal load split -> speedup vs
+# the host-DRAM-only single-path baseline.
+#
+#   CXL backend  = n_subchannels * 17.6 GB/s  (DDR5 32-bit subchannel)
+#   budget map   = {1 GB: 2 ch, 2 GB: 4 ch, 4 GB: 8 ch, 8 GB: 8 ch} (cap 8)
+#   B_cxl_line   = min(CXL Gen5 x16 link, CXL backend)
+#   B_dram_line  = min(uplink Gen5 x16, host backend)
+#   DRAM-only    = min(N * GPU_link, B_dram_line)      (baseline)
+#   dual (opt)   = min(N * GPU_link, B_dram_line + B_cxl_line)  (water-filled)
+#   speedup      = dual / dram_only
+# --------------------------------------------------------------------------
+def cxl_budget_channels(cxl_gb):
+    """CXL memory budget (GB) -> number of DDR5 subchannels (cap 8)."""
+    return min(2 * cxl_gb, 8)
+
+
+def cxl_backend_bw(cxl_gb):
+    """CXL backend bandwidth (B/s) for a given memory budget in GB."""
+    return cxl_budget_channels(cxl_gb) * DDR5_SUBCH
+
+
+def dual_bound_optimal(n_gpu, n_dram_ch=8, cxl_gb=8, write_scale=1.0,
+                       cxl_links=1):
+    """Optimal dual-path staging bound under a CXL memory budget.
+
+    Baseline is the host-DRAM-only single path: all N GPUs egress through the
+    shared Gen5 uplink into host DRAM. Dual splits traffic across DRAM (uplink)
+    and CXL (P2P), water-filled to the two independent line capacities, so the
+    optimal split ratio is B_dram_line : B_cxl_line.
+
+    ``cxl_links`` is the number of Gen5 x16 expander links (one per expander);
+    the CXL line capacity is min(cxl_links * link, backend).
+    """
+    gpu_link = write_bw(PCIE_GEN4_X16, write_scale)
+    uplink = write_bw(PCIE_GEN5_X16, write_scale)
+    cxl_link = cxl_links * write_bw(PCIE_GEN5_X16, write_scale)
+    dram_backend = n_dram_ch * DDR5_SUBCH
+    cxl_backend = cxl_backend_bw(cxl_gb)
+
+    b_dram_line = min(uplink, dram_backend)
+    b_cxl_line = min(cxl_link, cxl_backend)
+    total = n_gpu * gpu_link
+
+    dram_only = min(total, b_dram_line)
+    dual = min(total, b_dram_line + b_cxl_line)
+
+    denom = b_dram_line + b_cxl_line
+    split_dram_frac = b_dram_line / denom if denom > 0 else 1.0
+
+    return {
+        "n_gpu": n_gpu,
+        "cxl_gb": cxl_gb,
+        "cxl_channels": cxl_budget_channels(cxl_gb),
+        "gpu_egress_gbs": total / 1e9,
+        "dram_line_gbs": b_dram_line / 1e9,
+        "cxl_line_gbs": b_cxl_line / 1e9,
+        "dram_only_gbs": dram_only / 1e9,
+        "dual_gbs": dual / 1e9,
+        "speedup": dual / dram_only if dram_only > 0 else 0.0,
+        "split_dram_frac": split_dram_frac,
+    }
+
+
+def budget_sweep(n_gpus=(4, 8), budgets=(1, 2, 4, 8), n_dram_ch=8,
+                 write_scale=1.0):
+    """Print the CXL-budget -> speedup table for 4-GPU and 8-GPU write."""
+    hdr = ("CXL budget | ch | CXL line | " + " | ".join(
+        f"{n}GPU dual  speedup" for n in n_gpus
+    ))
+    print("Dual-path speedup vs host-DRAM-only (write_scale=%.2f, "
+          "host=%d ch)" % (write_scale, n_dram_ch))
+    print("=" * 78)
+    print(hdr)
+    print("-" * 78)
+    for gb in budgets:
+        cols = []
+        for n in n_gpus:
+            r = dual_bound_optimal(n, n_dram_ch, gb, write_scale)
+            cols.append("%5.2f   %.2fx" % (r["dual_gbs"], r["speedup"]))
+        r = dual_bound_optimal(n_gpus[0], n_dram_ch, gb, write_scale)
+        print(f"{gb:>3d} GB     | {r['cxl_channels']:>2d} | "
+              f"{r['cxl_line_gbs']:5.2f}  | " + " | ".join(cols))
+    print()
+    print("optimal split (DRAM:CXL) per budget:")
+    for gb in budgets:
+        r = dual_bound_optimal(4, n_dram_ch, gb, write_scale)
+        print(f"  {gb:>3d} GB -> {r['split_dram_frac']*100:5.1f}% DRAM : "
+              f"{(1 - r['split_dram_frac'])*100:5.1f}% CXL")
 
 
 def gen_trace(size_bytes, chunk_size, interval, num_ckpts, hot_frac):
@@ -334,7 +426,20 @@ def main():
     ap.add_argument(
         "--topology", choices=("dram", "cxl", "both"), default="both"
     )
+    ap.add_argument(
+        "--budget-sweep", action="store_true",
+        help="print the CXL-memory-budget -> speedup table (4/8 GPU)",
+    )
+    ap.add_argument(
+        "--write-scale", type=float, default=1.0,
+        help="PcieLink write-completion scale (1.0 = posted, ~1.5 = "
+        "non-posted write)",
+    )
     args = ap.parse_args()
+
+    if args.budget_sweep:
+        budget_sweep(write_scale=args.write_scale)
+        return
 
     sweep()
 

@@ -84,3 +84,57 @@ Ruby 路径（PyTrafficGen→DMASequencer→Directory→CXLMemCtrl）语义上 �
 - 稳定带宽（Ruby + DDR5，512MiB）：写 ~28.5 GB/s，读 ~20.6 GB/s。
 - `DMASequencer` 现在会并行拆一个多 cache-line 请求为多个 64B 子请求（对应
   PCIe MRd 256B → 4×CXL.mem MemRd）。
+
+---
+
+## 2026-11-06 会话更新：CXL 内存预算扫描（target3）进度与问题
+
+> 承接 `target2.md` / `exec_summary_v3.md` 的 E0–E5，本会话推进 `target3.md` 的
+> 「CXL 内存预算 → 加速比」扫描。详见 `configs/example/gem5_library/target3.md`。
+
+### 已完成（可编译；周期仿真未跑通，见下方阻塞）
+
+1. **宿主分析模型** `tests/cxl_tests/simckpt/analytical_model.py`
+   - 新增 `cxl_budget_channels()` / `cxl_backend_bw()` / `dual_bound_optimal()` /
+     `budget_sweep()` + `--budget-sweep`/`--write-scale` CLI。
+   - 修复 `s2_dual_bound()` 忽略 `n_cxl_ch` 的隐患（`cxl_bw` 改 `min(link, n_cxl_ch×17.6)`）。
+   - 预算→加速比（写 staging，host 8ch 上行限）：**1 GB→1.63×、2/4/8 GB→2.0×**。
+2. **配置脚本** `configs/example/gem5_library/x86-cxl-ckptd-e6.py`
+   - 新增 `--gpus`(4/8)、`--cxl-lanes`、`--cxl-mem-size`（GB→通道=min(2×GB,8)）、
+     `--split-dram-frac`（缺省按理论速率算）、`--probe-cxl`。
+3. **benchmark** `tests/cxl_tests/simckpt/bench/ckptbench_e6_budget.c`
+   - 泛化到 8 GPU + 可变 CXL lane，整卡粒度最优分流 `k=round(N×f_dram)`。
+   - `SIMCKPT_MAX_QUEUES` 8→16（guest 侧；设备侧 `dmaPorts` 用 vector 本无上限）。
+4. **关键发现**：`x86_board.py` 的 S2 拓扑本就用 `std::vector` 动态建 lane，**无需改
+   board、无需 scons 重编**，`--gpus 8 --cxl-lanes 1` 即可建 9 队列。
+5. **资源就位**：按 README 的 Google Drive 链接拉取 `vmlinux`(6.12, 38MB) 与
+   `parsec.img`(24GB)，解压后经 `debugfs` 注入 `ckptbench_e6_budget`，最终放
+   `/home/work/simcxl-resources/`。
+
+### 关键结论
+
+- 单 CXL expander 下 **4 卡与 8 卡加速比相同**（都 ≈2.0×）：聚合被「上行 55.53 +
+  CXL 链路 55.53」卡死，与 GPU egress 无关。
+- 8 卡要赢 4 卡需 ≥2 个 expander：`dual_bound_optimal(8, 8, 8, cxl_links=2)`→3.0×、
+  `cxl_links=3`→3.54×（CXL 后端 140.8 限）。
+
+### 踩坑 / 阻塞
+
+1. **KVM 不可用（当前最大阻塞）**：容器无 `/dev/kvm`（无 `/proc/kvm`、`open` 报
+   `EPERM`）。gem5 全系统必须 KVM 快进 Linux 启动，纯 Timing 启动需数小时不可行。
+   需宿主机加载 `kvm_amd/kvm_intel` 模块，且容器 `docker run --device /dev/kvm`
+   （或 `--privileged`）重建后才能跑 Phase 3。
+2. **无 loop 设备**：容器无 `/dev/loop*`、无法 mount 磁盘镜像，注入 benchmark 改用
+   `debugfs` 直接写 ext4 分区 + `dd` 回写（partition offset = 2048×512）。
+3. **gem5 运行依赖缺失**：`gem5.opt` 缺 `libtcmalloc_minimal.so.4` 与
+   `libprotobuf.so.32`（Ubuntu 24.04 包名带 `t64` 后缀）。旧容器 apt 装过，重启即丢。
+4. **`/root` 是临时层**：资源曾放 `/root/simcxl-resources/`（overlay，重启即丢），
+   已迁到持久盘 `/home/work/simcxl-resources/`，并把 20 个 config 的 `local_path`
+   从 `/root/...` 改为 `/home/work/...`。
+
+### 待办
+
+- [ ] **Phase 3 周期仿真**（有 KVM 后）：4/8 卡 × {1,2,4,8}GB，快速扫描 32MiB +
+      512MiB 确认端点，比对分析模型（<5% 误差判据）。
+- [ ] **Phase 4 N-expander 扩展**：`dual_bound_optimal(cxl_links=k)` 扫 4/8 卡 ×
+      1–3 expander，量化「8 卡何时优于 4 卡」。

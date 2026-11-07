@@ -397,8 +397,8 @@ command = (
 
 # Please modify the paths of kernel and disk_image according to the location of your files.
 board.set_kernel_disk_workload(
-    kernel=KernelResource(local_path='/root/simcxl-resources/vmlinux'),
-    disk_image=DiskImageResource(local_path='/root/simcxl-resources/parsec.img'),
+    kernel=KernelResource(local_path='/home/work/simcxl-resources/vmlinux'),
+    disk_image=DiskImageResource(local_path='/home/work/simcxl-resources/parsec.img'),
     readfile_contents=command,
     kernel_args=board.get_default_kernel_args() + ["idle=nomwait"],
 )

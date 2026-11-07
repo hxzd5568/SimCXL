@@ -13,7 +13,7 @@ ENG_SRC = engine/gpu_dma_engine.c engine/sha256.c
 
 all: ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 \
 	ckptbench_p8 ckptbench_p9 ckptbench_p10 ckptbench_e1 ckptbench_e4_s1 \
-	ckptbench_e5_s2 trace_model topology_scale p10_scale
+	ckptbench_e5_s2 ckptbench_e6_budget trace_model topology_scale p10_scale
 
 ckptbench: bench/ckptbench.c $(LIB_SRC) engine/libckpt.h ckptd.h include/simckpt_uapi.h
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench.c $(LIB_SRC)
@@ -68,6 +68,11 @@ ckptbench_e5_s2: bench/ckptbench_e5_s2.c $(LIB_SRC) engine/gpu_dma_engine.c \
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_e5_s2.c $(LIB_SRC) \
 		engine/gpu_dma_engine.c
 
+ckptbench_e6_budget: bench/ckptbench_e6_budget.c $(LIB_SRC) engine/gpu_dma_engine.c \
+		engine/libckpt.h ckptd.h include/simckpt_uapi.h engine/gpu_dma_engine.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ bench/ckptbench_e6_budget.c $(LIB_SRC) \
+		engine/gpu_dma_engine.c
+
 # Host-side unit test: prove the balancer routes a full-size (512 MiB)
 # checkpoint without running gem5 (pure C, milliseconds).
 balancer_scale: balancer_scale.c balancer.c balancer.h
@@ -98,7 +103,8 @@ module:
 clean:
 	rm -f ckptbench ckptbench_p4 ckptbench_p5 ckptbench_p6 ckptbench_p7 \
 		ckptbench_p8 ckptbench_p9 ckptbench_p10 ckptbench_e1 ckptbench_e4_s1 \
-		ckptbench_e5_s2 balancer_scale trace_model topology_scale p10_scale
+		ckptbench_e5_s2 ckptbench_e6_budget balancer_scale trace_model \
+		topology_scale p10_scale
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/driver clean 2>/dev/null || true
 
 .PHONY: all module clean
