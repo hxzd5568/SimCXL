@@ -14,7 +14,11 @@
  * Measures (cycle-accurate, per-queue issue/done tick registers):
  *   DRAM-only : all N GPUs -> their DRAM lanes -> shared uplink -> DRAM
  *   CXL-only  : all N GPUs -> CXL lanes -> CXL backend (optional probe)
- *   dual      : k GPUs -> DRAM + (N-k) GPUs -> CXL, k = round(N * f_dram)
+ *   dual      : single-cut per GPU: each GPU's cpg chunks are cut once at the
+ *               4KB-aligned boundary n_d = round(cpg * f_dram); the first n_d
+ *               chunks -> its DRAM lane, the remaining cpg-n_d -> a CXL lane
+ *               (approximate water-fill, matching the real 4KB-granularity
+ *               software split).
  *
  * The optimal split fraction f_dram is passed in via --split-dram-frac (the
  * config computes it from the theoretical line rates) or, when omitted and
@@ -124,14 +128,19 @@ struct route {
     int cxl;  /* 1 = dst in CXL node, 0 = dst in DRAM node */
 };
 
-/* Run one phase: submit every GPU's `cpg` descriptors to its routed queue,
- * ring all touched queues back-to-back, wait, and return the phase span
- * (min issue_tick .. max done_tick) across the touched queues. */
+/* Run one phase: submit every GPU's `cpg` descriptors, ring all touched queues
+ * back-to-back, wait, and return the phase span (min issue_tick .. max
+ * done_tick) across the touched queues.
+ *
+ * `n_d < 0` -> whole-GPU routing: each GPU's full `cpg` chunks go to the queue
+ * given by `rt[g]`. `n_d >= 0` -> single-cut routing: each GPU's `cpg` chunks
+ * are cut once at the 4KB-aligned boundary `n_d` (first `n_d` chunks -> its
+ * DRAM lane, the remaining `cpg - n_d` -> a CXL lane). */
 static void
 run_phase(struct simckpt_ctx *ctx, int n_gpu, int n_cxl, uint32_t cpg,
           uint32_t chunk, uint8_t **dram, uint8_t **cxl,
           uint64_t **dram_phys, uint64_t **cxl_phys,
-          const struct route *rt, uint64_t *qdone,
+          int n_d, const struct route *rt, uint64_t *qdone,
           uint64_t *start_out, uint64_t *end_out)
 {
     int nq = n_gpu + n_cxl;
@@ -144,16 +153,34 @@ run_phase(struct simckpt_ctx *ctx, int n_gpu, int n_cxl, uint32_t cpg,
         exit(1);
     }
 
-    /* Submit (noring) each GPU's chunks to its routed queue. */
+    /* Submit (noring) each GPU's chunks. */
     for (int g = 0; g < n_gpu; g++) {
-        uint8_t *dst_base = rt[g].cxl ? cxl[g] : dram[g];
-        uint64_t *dst_phys = rt[g].cxl ? cxl_phys[g] : dram_phys[g];
-        for (uint32_t c = 0; c < cpg; c++)
-            fill_stage_desc(&desc[c], dst_phys[c], chunk, 1, c);
-        simckpt_submit_batch_noring(ctx, rt[g].q, desc, cpg);
-        touched[rt[g].q] = 1;
-        per_q[rt[g].q] += cpg;
-        (void)dst_base;
+        if (n_d >= 0) {
+            /* Single-cut: one 4KB-aligned cut per GPU. */
+            int q_dram = g;
+            int q_cxl = n_gpu + (g % n_cxl);
+            uint32_t nd = (uint32_t)n_d;
+            for (uint32_t c = 0; c < nd; c++)
+                fill_stage_desc(&desc[c], dram_phys[g][c], chunk, 1, c);
+            simckpt_submit_batch_noring(ctx, q_dram, desc, nd);
+            touched[q_dram] = 1;
+            per_q[q_dram] += nd;
+
+            for (uint32_t c = nd; c < cpg; c++)
+                fill_stage_desc(&desc[c - nd], cxl_phys[g][c], chunk, 1, c);
+            simckpt_submit_batch_noring(ctx, q_cxl, desc, cpg - nd);
+            touched[q_cxl] = 1;
+            per_q[q_cxl] += cpg - nd;
+        } else {
+            uint8_t *dst_base = rt[g].cxl ? cxl[g] : dram[g];
+            uint64_t *dst_phys = rt[g].cxl ? cxl_phys[g] : dram_phys[g];
+            for (uint32_t c = 0; c < cpg; c++)
+                fill_stage_desc(&desc[c], dst_phys[c], chunk, 1, c);
+            simckpt_submit_batch_noring(ctx, rt[g].q, desc, cpg);
+            touched[rt[g].q] = 1;
+            per_q[rt[g].q] += cpg;
+            (void)dst_base;
+        }
     }
 
     /* Ring all touched queues back-to-back. */
@@ -273,7 +300,7 @@ main(int argc, char **argv)
         rt[g].cxl = 0;
     }
     run_phase(ctx, n_gpu, n_cxl, cpg, chunk, dram, cxl, dram_phys, cxl_phys,
-              rt, qdone, &s, &e);
+              -1, rt, qdone, &s, &e);
     double b_dram_only = gbps(total, e > s ? e - s : 0);
 
     /* ---- optional CXL-only probe ---- */
@@ -284,11 +311,11 @@ main(int argc, char **argv)
             rt[g].cxl = 1;
         }
         run_phase(ctx, n_gpu, n_cxl, cpg, chunk, dram, cxl, dram_phys,
-                  cxl_phys, rt, qdone, &s, &e);
+                  cxl_phys, -1, rt, qdone, &s, &e);
         b_cxl_only = gbps(total, e > s ? e - s : 0);
     }
 
-    /* ---- dual: k GPUs -> DRAM, (N-k) GPUs -> CXL (optimal split) ---- */
+    /* ---- dual: single-cut per GPU (4KB-aligned water-fill) ---- */
     double f = split_frac;
     if (f < 0.0) {
         if (probe_cxl && b_dram_only > 0 && b_cxl_only > 0)
@@ -296,31 +323,25 @@ main(int argc, char **argv)
         else
             f = 0.5;
     }
-    int k = (int)(n_gpu * f + 0.5);
-    if (k < 1)
-        k = 1;
-    if (k >= n_gpu)
-        k = n_gpu - 1;
-    for (int g = 0; g < n_gpu; g++) {
-        if (g < k) {
-            rt[g].q = g;
-            rt[g].cxl = 0;
-        } else {
-            rt[g].q = n_gpu + ((g - k) % n_cxl);
-            rt[g].cxl = 1;
-        }
-    }
+    /* One cut point per GPU (4KB-aligned, integer chunk count). */
+    int n_d = (int)((double)cpg * f + 0.5);
+    if (n_d < 1)
+        n_d = 1;
+    if (n_d >= (int)cpg)
+        n_d = (int)cpg - 1;
     run_phase(ctx, n_gpu, n_cxl, cpg, chunk, dram, cxl, dram_phys, cxl_phys,
-              rt, qdone, &s, &e);
+              n_d, rt, qdone, &s, &e);
     double b_dual = gbps(total, e > s ? e - s : 0);
 
-    /* verify payloads (DRAM chunks for g<k, CXL chunks for g>=k) */
+    /* verify payloads: DRAM chunks [0, n_d), CXL chunks [n_d, cpg) */
     uint64_t mism = 0;
     for (int g = 0; g < n_gpu; g++) {
-        uint8_t *buf = (g < k) ? dram[g] : cxl[g];
-        for (uint32_t c = 0; c < cpg; c++)
-            mism += gpu_payload_check(&eng, buf + (size_t)c * chunk, chunk,
-                                      1, c);
+        for (uint32_t c = 0; c < (uint32_t)n_d; c++)
+            mism += gpu_payload_check(&eng, dram[g] + (size_t)c * chunk,
+                                      chunk, 1, c);
+        for (uint32_t c = (uint32_t)n_d; c < cpg; c++)
+            mism += gpu_payload_check(&eng, cxl[g] + (size_t)c * chunk,
+                                      chunk, 1, c);
     }
 
     double speedup = b_dram_only > 0 ? b_dual / b_dram_only : 0.0;
@@ -330,8 +351,8 @@ main(int argc, char **argv)
     if (probe_cxl)
         printf("  CXL-only  : %.2f GB/s (%d GPU -> %d CXL lane(s))\n",
                b_cxl_only, n_gpu, n_cxl);
-    printf("  split     : %d DRAM + %d CXL GPUs (f_dram=%.3f)\n",
-           k, n_gpu - k, f);
+    printf("  split     : %d DRAM + %d CXL chunks/GPU (f_dram=%.3f)\n",
+           n_d, (int)cpg - n_d, f);
     printf("  dual      : %.2f GB/s\n", b_dual);
     printf("  speedup vs DRAM-only : %.3fx\n", speedup);
     printf("  mismatches : %" PRIu64 "\n", mism);
