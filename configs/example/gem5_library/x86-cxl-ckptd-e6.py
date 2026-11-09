@@ -59,6 +59,13 @@ _parser.add_argument(
     help="CXL memory budget in GB (backend channels = min(2*GB, 8))",
 )
 _parser.add_argument(
+    "--cxl-channels",
+    type=int,
+    default=0,
+    help="Override CXL backend channel count (0 = derive from budget "
+    "min(2*GB, 8)); e.g. 1 = single subchannel",
+)
+_parser.add_argument(
     "--dram-channels",
     type=int,
     default=8,
@@ -98,9 +105,13 @@ _args, _ = _parser.parse_known_args()
 
 # --- theoretical line rates (target3.md sec 2.1) --------------------------
 PCIE_GEN5_X16 = 55.53  # GB/s (uplink and expander link)
-DDR5_SUBCH = 17.6      # GB/s per 32-bit DDR5 subchannel
+DDR5_SUBCH = 17.6  # GB/s per 32-bit DDR5 subchannel
 
-_cxl_ch = min(2 * _args.cxl_mem_size, 8)
+_cxl_ch = (
+    _args.cxl_channels
+    if _args.cxl_channels > 0
+    else min(2 * _args.cxl_mem_size, 8)
+)
 _b_dram_line = min(PCIE_GEN5_X16, _args.dram_channels * DDR5_SUBCH)
 _b_cxl_line = min(_args.cxl_lanes * PCIE_GEN5_X16, _cxl_ch * DDR5_SUBCH)
 _split_frac = _args.split_dram_frac
